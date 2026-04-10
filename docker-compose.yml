@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  router:
+    build: ./router
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-claude-haiku-4-5-20251001}
+      - ENABLED_ENGINES=${ENABLED_ENGINES:-tesseract,easyocr,doctr}
+    depends_on:
+      tesseract:
+        condition: service_healthy
+      easyocr:
+        condition: service_healthy
+      doctr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  tesseract:
+    build: ./engines/tesseract
+    restart: unless-stopped
+
+  easyocr:
+    build: ./engines/easyocr
+    volumes:
+      - easyocr_models:/models
+    restart: unless-stopped
+
+  doctr:
+    build: ./engines/doctr
+    volumes:
+      - doctr_models:/models
+    restart: unless-stopped
+
+  paddleocr:
+    build: ./engines/paddleocr
+    profiles:
+      - full
+    restart: unless-stopped
+
+  surya:
+    build: ./engines/surya
+    volumes:
+      - surya_models:/models
+    profiles:
+      - full
+    restart: unless-stopped
+
+volumes:
+  easyocr_models:
+  doctr_models:
+  surya_models:

@@ -1,0 +1,36 @@
+# Minimal stack: router + tesseract only.
+#
+# Fastest startup, smallest footprint, zero model downloads.
+# Ideal for CI, quick demos, or environments where disk/RAM is constrained.
+#
+# Usage: docker compose -f docker-compose.minimal.yml up
+#
+# Why: The full stack (easyocr + doctr) downloads several GB of model weights
+#      on first run; this file lets you validate the API contract instantly.
+
+version: "3.9"
+
+services:
+  router:
+    build: ./router
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-claude-haiku-4-5-20251001}
+      - ENABLED_ENGINES=tesseract
+    depends_on:
+      tesseract:
+        condition: service_healthy
+    restart: unless-stopped
+
+  tesseract:
+    build: ./engines/tesseract
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

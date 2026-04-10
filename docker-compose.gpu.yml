@@ -1,0 +1,42 @@
+# GPU override compose file.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#
+# Adds NVIDIA GPU device reservations to the ML-heavy engines so they can
+# leverage CUDA acceleration when the host has an NVIDIA GPU and the
+# nvidia-container-toolkit is installed.
+#
+# Why: GPU inference is 5-20x faster for deep-learning engines; keeping GPU
+#      config in a separate override file means CPU deployments need no changes.
+
+version: "3.9"
+
+services:
+  easyocr:
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+  paddleocr:
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+  surya:
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]

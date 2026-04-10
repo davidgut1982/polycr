@@ -1,0 +1,58 @@
+# Integration test workflow — runs on every pull request.
+#
+# Why: Validates the full API contract (health, raw OCR, full pipeline) against
+#      a real running minimal stack before any PR is merged.
+# Strategy: Spin up docker-compose.minimal.yml, run tests, always tear down.
+
+name: Integration Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install test dependencies
+        run: pip install requests Pillow
+
+      - name: Start minimal stack
+        run: docker compose -f docker-compose.minimal.yml up -d --build
+
+      - name: Wait for services to become healthy
+        run: |
+          echo "Waiting up to 120s for router to be ready..."
+          for i in $(seq 1 24); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Router is healthy after $((i * 5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Router did not become healthy in time"
+          docker compose -f docker-compose.minimal.yml logs
+          exit 1
+
+      - name: Run integration tests
+        env:
+          POLYCR_BASE_URL: http://localhost:8000
+        run: python tests/test_pipeline.py
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.minimal.yml logs
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f docker-compose.minimal.yml down -v
