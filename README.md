@@ -6,11 +6,17 @@ polycr fans out every image to multiple OCR engines in parallel, then uses a vis
 
 ---
 
+## Used With
+
+[ocr-mcp](https://github.com/davidgut1982/ocr-mcp) — MCP server that wraps this stack and exposes OCR tools to OpenClaw. Calls the `/ocr/raw` endpoint and handles engine selection, fallback, and image preprocessing.
+
+---
+
 ## Quick start
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/your-org/polycr.git && cd polycr
+git clone https://github.com/davidgut1982/polycr.git && cd polycr
 cp .env.example .env
 # Edit .env — set LLM_API_KEY at minimum
 
