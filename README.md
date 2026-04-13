@@ -97,6 +97,29 @@ If `LLM_API_KEY` is not set, the `/process` endpoint falls back to the highest-c
 
 ---
 
+## Architecture
+
+polycr exposes two complementary services:
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| `router` (polycr) | 8000 | Multi-engine text extraction — fans out to OCR engines, reconciles with an LLM, returns structured text. Used for document classification and filename generation. |
+| `ocrmypdf` | 8001 | Archival PDF generation — wraps ocrmypdf to produce a searchable PDF with an embedded text layer. Used to create the final stored document. |
+
+These are intentionally separate: the router is optimised for high-confidence text extraction (queried first), and ocrmypdf is optimised for producing a compact, searchable PDF suitable for long-term storage. A typical scan pipeline calls both in sequence:
+
+```
+scan_document → JPEG temp file
+    ↓
+:8000/ocr/raw   — multi-engine text extraction (classification + filename)
+    ↓
+:8001/pdf       — searchable PDF with embedded text layer (archival copy)
+    ↓
+Upload to Nextcloud
+```
+
+---
+
 ## API reference
 
 ### `POST /process`
@@ -139,6 +162,33 @@ OCR fan-out only — no LLM call.
 Readiness probe.
 
 **Response:** `{"status": "ok", "engines": ["tesseract", "easyocr", "doctr"]}`
+
+---
+
+### ocrmypdf service (port 8001)
+
+#### `POST /pdf`
+
+Run ocrmypdf on an uploaded image or PDF and return a searchable PDF.
+
+**Request:** `multipart/form-data` with `file` field (JPEG/PNG/PDF/TIFF).
+
+**Query params:**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `deskew` | `true` | Deskew the input image before OCR |
+| `optimize` | `1` | PDF optimization level (0 = none, 3 = maximum) |
+
+**Response (success):** PDF binary with `Content-Type: application/pdf`.
+
+**Response (error):** `{"error": "...", "detail": "..."}` with a 5xx status code.
+
+#### `GET /health`
+
+Readiness probe for the ocrmypdf service.
+
+**Response:** `{"status": "ok", "service": "ocrmypdf"}`
 
 ---
 

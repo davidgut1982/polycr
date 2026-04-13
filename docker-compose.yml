@@ -49,6 +49,12 @@ services:
       - full
     restart: unless-stopped
 
+  ocrmypdf:
+    build: ./services/ocrmypdf
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+
 volumes:
   easyocr_models:
   doctr_models:
