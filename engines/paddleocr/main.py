@@ -4,7 +4,7 @@ PaddleOCR engine microservice.
 Why: Exposes PaddleOCR behind the standard polycr REST contract, adding a
      high-accuracy CRNN-based alternative to the other engines.
 What: FastAPI service that initialises PaddleOCR at startup and returns text with
-      averaged confidence from the per-line result list.
+      averaged confidence from the per-line result list, plus polygon regions.
 Test: POST /ocr with a receipt image → engine=="paddleocr" and non-empty text;
       GET /health → {"status": "ok", "engine": "paddleocr"}.
 """
@@ -57,7 +57,7 @@ async def ocr(file: UploadFile = File(...)):
     Why: Standard OCR endpoint consumed by the router.
     What: Converts uploaded image to numpy array, runs PaddleOCR, flattens the
           nested result list (pages → lines → [box, (text, conf)]) and averages
-          confidence across all detected text regions.
+          confidence across all detected text regions. Returns polygon regions.
     Test: POST a document image → expect text and confidence > 0 for real content.
     """
     if ocr_engine is None:
@@ -71,18 +71,32 @@ async def ocr(file: UploadFile = File(...)):
 
         lines: list[str] = []
         confidences: list[float] = []
+        regions: list[dict] = []
         if results:
             for page in results:
                 if page:
                     for line in page:
+                        box = line[0]  # polygon: [[x,y], [x,y], [x,y], [x,y]]
                         text_conf = line[1]
-                        lines.append(text_conf[0])
-                        confidences.append(float(text_conf[1]))
+                        text = text_conf[0]
+                        conf = float(text_conf[1])
+                        lines.append(text)
+                        confidences.append(conf)
+                        regions.append({
+                            "polygon": box,
+                            "text": text,
+                            "confidence": conf
+                        })
 
         text = "\n".join(lines).strip()
         avg_confidence = (sum(confidences) / len(confidences) * 100) if confidences else 0.0
 
-        return {"engine": ENGINE_NAME, "text": text, "confidence": avg_confidence}
+        return {
+            "engine": ENGINE_NAME,
+            "text": text,
+            "confidence": avg_confidence,
+            "regions": regions
+        }
     except Exception as exc:
         logger.error("OCR failed: %s", exc)
         return {"engine": ENGINE_NAME, "error": str(exc)}
