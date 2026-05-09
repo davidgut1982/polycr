@@ -67,7 +67,7 @@ async def ocr(file: UploadFile = File(...)):
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         img_array = np.array(image)
 
-        results = ocr_engine.ocr(img_array)
+        results = ocr_engine.ocr(img_array, cls=True)
 
         lines: list[str] = []
         confidences: list[float] = []
