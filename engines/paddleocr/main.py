@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     global ocr_engine
     logger.info("Initialising PaddleOCR engine...")
     try:
-        ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=False, show_log=False)
+        ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
         logger.info("PaddleOCR engine ready.")
     except Exception as exc:
         logger.error("PaddleOCR init failed: %s", exc)
