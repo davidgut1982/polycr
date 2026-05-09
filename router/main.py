@@ -457,31 +457,72 @@ def _cluster_score(cluster, image_area: float) -> float:
     return n_regions * aspect_bonus * (1.0 + min(density * 1e6, 5.0))
 
 
+def _infer_4_corners_from_2_diagonal(corners: list[list[float]]) -> Optional[list[list[float]]]:
+    if len(corners) != 2:
+        return None
+    p1, p2 = corners[0], corners[1]
+    if p1[0] + p1[1] < p2[0] + p2[1]:
+        tl, br = p1, p2
+    else:
+        tl, br = p2, p1
+    return [tl, [br[0], tl[1]], br, [tl[0], br[1]]]
+
+
+def _infer_4_corners_from_3_parallelogram(corners: list[list[float]]) -> Optional[list[list[float]]]:
+    if len(corners) != 3:
+        return None
+    a, b, c = corners[0], corners[1], corners[2]
+    d = [a[0] + c[0] - b[0], a[1] + c[1] - b[1]]
+    return [a, b, c, d]
+
+
+def _validate_quadrilateral_aspect(corners: list[list[float]], min_aspect: float = 0.3, max_aspect: float = 4.0) -> bool:
+    if len(corners) != 4:
+        return False
+    xs = [c[0] for c in corners]
+    ys = [c[1] for c in corners]
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    if w < 10 or h < 10:
+        return False
+    aspect = h / w if w > 0 else float('inf')
+    return min_aspect <= aspect <= max_aspect
+
+
 def detect_corners_docaligner(img: np.ndarray) -> Optional[list[list[float]]]:
     """
-    Why: Purpose-built CNN for document corner detection. Returns ordered corners
-         (TL, TR, BR, BL) that encode orientation by construction.
-    What: Runs DocAligner heatmap regression model on BGR image, returns 4 corners
-          in original image coordinates, or None if no document detected.
-    Test: Pass a receipt image; expect 4 [x, y] points within image bounds.
+    Purpose-built CNN for document corner detection with Phase 3c geometric inference.
     """
     try:
         aligner = _get_docaligner()
         result = aligner(img)
-        if result is None or len(result) != 4:
-            # Reject partial detections (e.g., only 2 corners from low-contrast images)
-            if result is not None and len(result) < 4:
-                logger.warning(f"DocAligner returned only {len(result)} corners (need 4); rejecting")
-            return None
-        # result is Nx2 numpy array; convert to list of [x, y] pairs
-        corners = result.tolist()
-        # Sanity: ensure all points within image bounds
         h, w = img.shape[:2]
-        valid = all(
-            0 <= c[0] <= w and 0 <= c[1] <= h
-            for c in corners
-        )
-        return corners if valid else None
+        if result is None or len(result) == 0:
+            return None
+        corners = result.tolist()
+        if len(corners) == 4:
+            valid = all(0 <= c[0] <= w and 0 <= c[1] <= h for c in corners)
+            return corners if valid else None
+        if len(corners) == 2:
+            logger.info("DocAligner returned 2 corners; attempting geometric inference")
+            inferred = _infer_4_corners_from_2_diagonal(corners)
+            if inferred and _validate_quadrilateral_aspect(inferred):
+                valid = all(0 <= c[0] <= w and 0 <= c[1] <= h for c in inferred)
+                if valid:
+                    logger.info(f"Geometric inference succeeded (2->4): {inferred}")
+                    return inferred
+            return None
+        if len(corners) == 3:
+            logger.info("DocAligner returned 3 corners; attempting parallelogram closure")
+            inferred = _infer_4_corners_from_3_parallelogram(corners)
+            if inferred and _validate_quadrilateral_aspect(inferred):
+                valid = all(0 <= c[0] <= w and 0 <= c[1] <= h for c in inferred)
+                if valid:
+                    logger.info(f"Geometric inference succeeded (3->4): {inferred}")
+                    return inferred
+            return None
+        logger.warning(f"DocAligner returned {len(corners)} corners (unexpected)")
+        return None
     except Exception as e:
         logger.warning(f"DocAligner detection failed: {e}")
         return None
