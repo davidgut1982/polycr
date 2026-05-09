@@ -1,5 +1,4 @@
-"""
-Shared Pydantic models for the polycr router.
+"""Shared Pydantic models for the polycr router.
 
 Why: Centralises request/response schemas so the router endpoints, LLM reconciler,
      and tests all share a single source of truth without duplicating field names.
@@ -14,6 +13,13 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class Region(BaseModel):
+    """Text region with polygon boundary and per-region confidence."""
+    polygon: list[list[float]] = []
+    text: str = ""
+    confidence: float = 0.0
+
+
 class EngineResult(BaseModel):
     """Single engine OCR output, including an optional error field."""
 
@@ -21,6 +27,7 @@ class EngineResult(BaseModel):
     text: str = ""
     confidence: float = 0.0
     error: str = ""
+    regions: list[Region] = []
 
 
 class ProcessResponse(BaseModel):
