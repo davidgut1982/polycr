@@ -31,7 +31,6 @@ async def lifespan(app: FastAPI):
     global ocr_engine
     logger.info("Initialising PaddleOCR engine...")
     try:
-        # Disable cls for now due to backend inference compatibility issues
         ocr_engine = PaddleOCR(lang="en")
         logger.info("PaddleOCR engine ready.")
     except Exception as exc:
@@ -81,18 +80,14 @@ async def ocr(file: UploadFile = File(...)):
                         text_conf = line[1]
                         text = text_conf[0]
                         conf = float(text_conf[1])
-                        # cls angle data is not available without use_angle_cls=True
-                        # Default to 0/0.0 for compatibility with Region schema
-                        angle = 0
-                        angle_confidence = 0.0
                         lines.append(text)
                         confidences.append(conf)
                         regions.append({
                             "polygon": box,
                             "text": text,
                             "confidence": conf,
-                            "angle": angle,
-                            "angle_confidence": angle_confidence
+                            "angle": 0,
+                            "angle_confidence": 0.0
                         })
 
         text = "\n".join(lines).strip()
