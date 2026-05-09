@@ -250,7 +250,9 @@ async def detect_edges_endpoint(file: UploadFile = File(...)):
             "height": y_max - y_min,
         },
         "confidence": confidence,
-        "method": method
+        "method": method,
+        "area_ratio": result.get("area_ratio", 0.0),
+        "center_offset": result.get("center_offset", 0.0)
     }
 
 
@@ -426,6 +428,105 @@ def _is_degenerate(ordered: np.ndarray) -> bool:
     return area < 100.0
 
 
+def _cluster_regions_by_proximity(regions, image_diag: float):
+    """
+    Group text regions by spatial proximity using union-find.
+
+    Receipt text is densely packed; background text is usually sparse and far
+    from the receipt. Clusters regions whose centroids are within
+    proximity_threshold of each other. Threshold is 8% of image diagonal,
+    calibrated so receipt-internal lines (~50px apart) merge while background
+    text (~500px+ away) stays separate.
+
+    Args:
+        regions: List of OCR region objects with .polygon attribute
+        image_diag: Diagonal length of image (used for threshold scaling)
+
+    Returns:
+        List of clusters, each cluster is a list of region objects
+    """
+    if not regions:
+        return []
+
+    proximity_threshold = image_diag * 0.08
+
+    # Compute centroids
+    centroids = []
+    for r in regions:
+        pts = np.array(r.polygon)
+        centroids.append(pts.mean(axis=0))
+
+    # Union-find to group nearby regions
+    n = len(regions)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    # Connect regions within proximity threshold
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centroids[i] - centroids[j])
+            if dist <= proximity_threshold:
+                union(i, j)
+
+    # Group by cluster root
+    clusters = {}
+    for i in range(n):
+        root = find(i)
+        clusters.setdefault(root, []).append(regions[i])
+
+    return list(clusters.values())
+
+
+def _cluster_score(cluster, image_area: float) -> float:
+    """
+    Score a cluster: more regions + denser packing + receipt-like aspect = higher score.
+    Penalize clusters whose bbox is too large (catches lone background text).
+
+    Args:
+        cluster: List of region objects in this cluster
+        image_area: Total image area in pixels
+
+    Returns:
+        Float score; higher is better
+    """
+    if not cluster:
+        return 0.0
+
+    # Extract all points from cluster
+    all_pts = np.array([pt for r in cluster for pt in r.polygon])
+    minx, miny = all_pts.min(axis=0)
+    maxx, maxy = all_pts.max(axis=0)
+    bbox_w = maxx - minx
+    bbox_h = maxy - miny
+    bbox_area = bbox_w * bbox_h
+    bbox_area_ratio = bbox_area / image_area
+
+    # Penalize clusters covering >95% of image (likely background)
+    if bbox_area_ratio > 0.95:
+        return 0.0
+
+    # Score based on region count, density, and aspect ratio
+    n_regions = len(cluster)
+    density = n_regions / max(bbox_area, 1.0)
+
+    # Receipt prior: prefer tall (portrait) clusters
+    aspect_h_w = bbox_h / max(bbox_w, 1.0)
+    aspect_bonus = 1.0 if 1.0 <= aspect_h_w <= 4.0 else 0.5
+
+    # Combined score: regions × aspect × (1 + density normalized)
+    return n_regions * aspect_bonus * (1.0 + min(density * 1e6, 5.0))
+
+
 async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[float]]], str]:
     """
     Why: Shared corner-detection logic with fallback strategy: try text-region detection
@@ -459,13 +560,29 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
             return edge_result["corners"], "edges"
         return None, "no-regions"
 
-    # Collect text region polygons
+    # Step 1.5: Cluster regions by proximity to separate receipt from background
+    h, w = img.shape[:2]
+    image_area = h * w
+    image_diag = (h**2 + w**2) ** 0.5
+
+    clusters = _cluster_regions_by_proximity(result.regions, image_diag)
+    if not clusters:
+        return None, "no-clusters"
+
+    # Score each cluster and pick the best
+    cluster_scores = [(c, _cluster_score(c, image_area)) for c in clusters]
+    best_cluster = max(cluster_scores, key=lambda x: x[1])[0]
+
+    if not best_cluster:
+        return None, "all-clusters-rejected"
+
+    # Collect points only from the best cluster
     points = []
-    for region in result.regions:
+    for region in best_cluster:
         points.extend(region.polygon)
 
     if len(points) < 4:
-        # Insufficient text points; try edge-based
+        # Insufficient text points in best cluster; try edge-based
         edge_result = detect_document_edges(img)
         if edge_result is not None:
             return edge_result["corners"], "edges"
@@ -487,13 +604,14 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     text_w = x_max - x_min
     text_h = y_max - y_min
     text_aspect = text_h / max(text_w, 1)
-    text_area_ratio = (text_w * text_h) / (img.shape[0] * img.shape[1])
+    text_area_ratio = (text_w * text_h) / image_area
 
     text_corners = [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]]
+    cluster_status = f"cluster:{len(best_cluster)}:{len(clusters)}"
 
     # Accept text if aspect is sane and covers enough of image
-    if 1.2 <= text_aspect <= 3.5 and text_area_ratio > 0.30:
-        return text_corners, "text"
+    if 1.2 <= text_aspect <= 4.5 and text_area_ratio > 0.30:
+        return text_corners, cluster_status
 
     # Step 3: Text aspect suspect; try edge-based
     edge_result = detect_document_edges(img)
@@ -501,7 +619,6 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
         return edge_result["corners"], "edges"
 
     # Step 4: Fall back to full image
-    h, w = img.shape[:2]
     return [[0, 0], [w, 0], [w, h], [0, h]], "fallback"
 
 
@@ -592,8 +709,8 @@ async def correct_document(
         det_h = max(det_y_coords) - min(det_y_coords)
         det_ratio = det_h / max(det_w, 1)
         
-        if det_ratio > 3.5 or det_ratio < 1.2:
-            logger.warning(f"aspect sanity failed: ratio={det_ratio:.2f} outside [1.2, 3.5]; using full image")
+        if det_ratio > 4.5 or det_ratio < 1.2:
+            logger.warning(f"aspect sanity failed: ratio={det_ratio:.2f} outside [1.2, 4.5]; using full image")
             h, w = img_cv.shape[:2]
             detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
             redetect_status = "fallback-extreme-aspect"
