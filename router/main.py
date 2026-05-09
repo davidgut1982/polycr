@@ -221,9 +221,9 @@ async def detect_edges_endpoint(file: UploadFile = File(...)):
             "method": "edges"
         }
 
-    corners, confidence = detect_document_edges(img_cv)
+    result = detect_document_edges(img_cv)
 
-    if corners is None:
+    if result is None:
         return {
             "corners": None,
             "bbox": None,
@@ -231,6 +231,10 @@ async def detect_edges_endpoint(file: UploadFile = File(...)):
             "error": "no valid quadrilateral found",
             "method": "edges"
         }
+
+    corners = result["corners"]
+    confidence = result["confidence"]
+    method = result.get("method", "edges")
 
     x_coords = [c[0] for c in corners]
     y_coords = [c[1] for c in corners]
@@ -246,7 +250,7 @@ async def detect_edges_endpoint(file: UploadFile = File(...)):
             "height": y_max - y_min,
         },
         "confidence": confidence,
-        "method": "edges"
+        "method": method
     }
 
 
@@ -257,25 +261,26 @@ def _auto_canny(gray, sigma=0.33):
     return cv2.Canny(gray, low, high)
 
 
-def detect_document_edges(img: np.ndarray) -> tuple[Optional[list[list[float]]], float]:
+def detect_document_edges(img: np.ndarray) -> Optional[dict]:
     """
     Edge-based document detection. Returns tuple (corners, confidence) or (None, 0.0)
     if no plausible quadrilateral found.
 
     Why: Fallback corner detection when text-region detection fails or gives
          suspect aspect ratio. Implements jscanify-style edge-detection algorithm.
-    
+
     What:
       1. Convert to grayscale; apply Gaussian blur (5x5).
-      2. Try two edge detection methods: auto-Canny (sigma=0.33) and adaptive threshold.
-      3. Dilate edges to close small gaps.
+      2. Try Canny first; if edge density < 1%, fall back to adaptive threshold.
+      3. Close gaps with morphology.
       4. Find external contours.
-      5. For each contour, approximate to polygon with epsilon=2% of perimeter.
-      6. Filter to quadrilaterals (4 vertices) with area 30-92% of image.
-      7. Filter by center offset (max 60% of image diagonal from center).
-      8. Pick candidate with highest confidence.
-      9. Order corners as TL/TR/BR/BL using sum/diff heuristic.
-      10. Return corners + confidence.
+      5. For each contour, approximate to polygon with epsilon=0.04 of perimeter.
+      6. Reject contours touching image edges (within 5px of boundary).
+      7. Filter to quadrilaterals (4 vertices) with area 30-92% of image (restored to spec).
+      8. Filter by center offset (max 60% of image diagonal from center).
+      9. Pick candidate with highest confidence.
+      10. Order corners as TL/TR/BR/BL using sum/diff heuristic.
+      11. Return corners + confidence + method used (canny or adaptive).
 
     NOTE: This function does NOT filter by receipt aspect ratio. The projected
     shape in image space can be near-square for tilted receipts. Aspect filtering
@@ -287,44 +292,68 @@ def detect_document_edges(img: np.ndarray) -> tuple[Optional[list[list[float]]],
     img_area = float(H * W)
     img_cx, img_cy = W / 2.0, H / 2.0
     img_diag = (W**2 + H**2) ** 0.5
+    EDGE_MARGIN = 5  # contours touching within 5px of image boundary are rejected
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    candidates = []
-    for method_name, edge_map in [
-        ("canny",    _auto_canny(blurred)),
-        ("adaptive", cv2.adaptiveThreshold(
+    canny = _auto_canny(blurred)
+    canny_density = float(np.count_nonzero(canny)) / img_area
+
+    if canny_density >= 0.01:  # Canny found enough edges
+        edge_map = canny
+        method_used = "canny"
+    else:  # Canny under-detected; fall back to adaptive
+        adaptive = cv2.adaptiveThreshold(
             blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 11, 2,
-        )),
-    ]:
-        dilated = cv2.dilate(edge_map, np.ones((3, 3), np.uint8), iterations=1)
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) != 4:
-                continue
-            pts = approx.reshape(4, 2).astype(float)
-            area = cv2.contourArea(approx)
-            area_ratio = area / img_area
-            if area_ratio < 0.005 or area_ratio > 0.95:
-                continue
-            cx, cy = pts.mean(axis=0)
-            dist = ((cx - img_cx)**2 + (cy - img_cy)**2) ** 0.5
-            center_offset = dist / (img_diag / 2.0)
-            if center_offset > 0.6:
-                continue
-            confidence = float(area_ratio * max(0.0, 1.0 - 1.5 * center_offset))
-            candidates.append({
-                "pts": pts, "area_ratio": float(area_ratio),
-                "center_offset": float(center_offset),
-                "confidence": confidence, "method": method_name,
-            })
+        )
+        edge_map = adaptive
+        method_used = "adaptive"
+
+    # Close gaps with morphology
+    kernel = np.ones((5, 5), np.uint8)
+    closed = cv2.morphologyEx(edge_map, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.04 * peri, True)  # eps=0.04 per real-data analysis
+        if len(approx) != 4:
+            continue
+        pts = approx.reshape(4, 2).astype(float)
+
+        # Reject contours touching image edges (almost always the photo frame)
+        touches_edge = any(
+            x < EDGE_MARGIN or x > W - EDGE_MARGIN or
+            y < EDGE_MARGIN or y > H - EDGE_MARGIN
+            for x, y in pts
+        )
+        if touches_edge:
+            continue
+
+        area = cv2.contourArea(approx)
+        area_ratio = area / img_area
+        if area_ratio < 0.30 or area_ratio > 0.92:  # restored to spec
+            continue
+
+        cx, cy = pts.mean(axis=0)
+        dist = ((cx - img_cx)**2 + (cy - img_cy)**2) ** 0.5
+        center_offset = dist / (img_diag / 2.0)
+        if center_offset > 0.6:
+            continue
+
+        confidence = float(area_ratio * max(0.0, 1.0 - 1.5 * center_offset))
+        candidates.append({
+            "pts": pts, "area_ratio": float(area_ratio),
+            "center_offset": float(center_offset),
+            "confidence": confidence, "method": method_used,
+        })
 
     if not candidates:
-        return None, 0.0
+        return None
 
     best = max(candidates, key=lambda c: c["confidence"])
     pts = best["pts"]
@@ -335,9 +364,14 @@ def detect_document_edges(img: np.ndarray) -> tuple[Optional[list[list[float]]],
     tr = pts[int(np.argmin(d))]
     bl = pts[int(np.argmax(d))]
     ordered = np.array([tl, tr, br, bl], dtype=np.float32)
-    confidence = best["confidence"]
 
-    return ordered.tolist(), confidence
+    return {
+        "corners": ordered.tolist(),
+        "area_ratio": best["area_ratio"],
+        "center_offset": best["center_offset"],
+        "confidence": best["confidence"],
+        "method": best["method"],
+    }
 
 
 
@@ -420,9 +454,9 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
 
     if not result.regions:
         # No text detected; try edge-based
-        edge_corners, edge_conf = detect_document_edges(img)
-        if edge_corners is not None:
-            return edge_corners, "edges"
+        edge_result = detect_document_edges(img)
+        if edge_result is not None:
+            return edge_result["corners"], "edges"
         return None, "no-regions"
 
     # Collect text region polygons
@@ -432,9 +466,9 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
 
     if len(points) < 4:
         # Insufficient text points; try edge-based
-        edge_corners, edge_conf = detect_document_edges(img)
-        if edge_corners is not None:
-            return edge_corners, "edges"
+        edge_result = detect_document_edges(img)
+        if edge_result is not None:
+            return edge_result["corners"], "edges"
         return None, "insufficient-points"
 
     points_np = np.array(points, dtype=np.float32)
@@ -462,9 +496,9 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
         return text_corners, "text"
 
     # Step 3: Text aspect suspect; try edge-based
-    edge_corners, edge_conf = detect_document_edges(img)
-    if edge_corners is not None:
-        return edge_corners, "edges"
+    edge_result = detect_document_edges(img)
+    if edge_result is not None:
+        return edge_result["corners"], "edges"
 
     # Step 4: Fall back to full image
     h, w = img.shape[:2]
