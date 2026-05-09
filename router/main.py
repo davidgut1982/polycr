@@ -665,7 +665,7 @@ async def correct_document(
                 logger.warning(f"fallback produced landscape ({w}x{h}); rotating 90 CW to portrait")
                 img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
                 h, w = img_cv.shape[:2]
-                detected_corners = [[0, 0], [h, 0], [h, w], [0, w]]  # Swap w,h for rotated image
+                detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
                 redetect_status = "fallback-extreme-aspect-rotated"
                 post_warp_rotation = 90
 
