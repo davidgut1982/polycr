@@ -5,21 +5,33 @@ Why: Provides a single stable REST API that fans out to all configured OCR engin
      services, preprocesses images, reconciles results via an LLM, and returns both
      raw per-engine output and a structured final answer.
 What: FastAPI app exposing POST /process (full pipeline), POST /ocr/raw (engines only),
-      and GET /health.  Engine selection is driven by the ENABLED_ENGINES env var.
+      GET /health, POST /detect (receipt corner detection), and POST /correct
+      (perspective rectification / deskew).  Engine selection is driven by the
+      ENABLED_ENGINES env var.
 Test: Start the router with at least the tesseract engine running; POST a JPEG to
       /process and assert the response has "text" and "engines_used" keys.
 """
 
 import asyncio
+import io
+import json
 import logging
+import math
 import os
+from typing import Optional
 
+import cv2
 import httpx
-from fastapi import FastAPI, UploadFile, File
+import numpy as np
+import pytesseract
+from PIL import Image
+from fastapi import FastAPI, Form, HTTPException, UploadFile, File
+from fastapi.responses import Response
 
 from llm import reconcile
 from models import EngineResult, ProcessResponse
 from preprocess import preprocess_image
+from PIL import ImageOps
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -98,6 +110,536 @@ async def ocr_raw(file: UploadFile = File(...)):
     clean = preprocess_image(image_bytes)
     results = await asyncio.gather(*[call_engine(e.strip(), clean) for e in ENABLED_ENGINES])
     return {"results": [r.dict() for r in results]}
+
+
+@app.post("/detect")
+async def detect_document(file: UploadFile = File(...)):
+    """
+    Why: Fast document corner/bbox detection for receipts-web auto-crop.
+    What: Runs PaddleOCR only (no Tesseract, no LLM) to extract text regions,
+          computes axis-aligned bounding box from region polygons with 8% padding,
+          and returns corners + bbox for client-side cropping.
+    Test: POST a receipt image → expect corners=[[[x,y], [x,y], [x,y], [x,y]]]
+          and bbox={"x": ..., "y": ..., "width": ..., "height": ...}.
+    """
+    if "paddleocr" not in ENABLED_ENGINES:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": 0.0,
+            "error": "paddleocr engine not enabled",
+        }
+
+    image_bytes = await file.read()
+    clean = preprocess_image(image_bytes)
+
+    result = await call_engine("paddleocr", clean)
+    if result.error:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": 0.0,
+            "error": result.error,
+        }
+
+    if not result.regions:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": result.confidence,
+            "error": "no text regions detected",
+        }
+
+    # Use shared helper: decode bytes → numpy before passing to detect_corners_internal
+    _arr = np.frombuffer(clean, np.uint8)
+    _img_cv = cv2.imdecode(_arr, cv2.IMREAD_COLOR)
+    if _img_cv is None:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": result.confidence,
+            "error": "could not decode preprocessed image",
+        }
+    corners, status = await detect_corners_internal(_img_cv)
+    if corners is None:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": result.confidence,
+            "error": f"corner detection failed: {status}",
+        }
+
+    x_min, y_min = corners[0]
+    x_max, y_max = corners[2]
+
+    return {
+        "corners": corners,
+        "bbox": {
+            "x": x_min,
+            "y": y_min,
+            "width": x_max - x_min,
+            "height": y_max - y_min,
+        },
+        "confidence": result.confidence,
+    }
+
+
+@app.post("/detect-edges")
+async def detect_edges_endpoint(file: UploadFile = File(...)):
+    """
+    Why: Direct edge-based document detection (jscanify-style Canny + contour).
+    What: Reads image, applies EXIF auto-orient, runs Canny edge detection,
+          finds contours, filters to 4-vertex quadrilaterals with sane aspect ratios,
+          and returns corners + confidence based on contour area.
+    Test: POST a receipt photographed at an angle -> expect corners and confidence > 0.5.
+    """
+    image_bytes = await file.read()
+    img_cv = None
+
+    # Try direct PIL EXIF auto-orient first
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        pil_img = ImageOps.exif_transpose(pil_img)
+        img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        logger.warning(f"EXIF transpose failed: {e}, trying fallback")
+
+    if img_cv is None:
+        try:
+            clean_bytes = preprocess_image(image_bytes)
+            arr = np.frombuffer(clean_bytes, np.uint8)
+            img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except Exception as e2:
+            logger.error(f"Both EXIF and preprocess failed: {e2}")
+
+    if img_cv is None:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": 0.0,
+            "error": "could not decode image",
+            "method": "edges"
+        }
+
+    corners, confidence = detect_document_edges(img_cv)
+
+    if corners is None:
+        return {
+            "corners": None,
+            "bbox": None,
+            "confidence": 0.0,
+            "error": "no valid quadrilateral found",
+            "method": "edges"
+        }
+
+    x_coords = [c[0] for c in corners]
+    y_coords = [c[1] for c in corners]
+    x_min, x_max = min(x_coords), max(x_coords)
+    y_min, y_max = min(y_coords), max(y_coords)
+
+    return {
+        "corners": corners,
+        "bbox": {
+            "x": x_min,
+            "y": y_min,
+            "width": x_max - x_min,
+            "height": y_max - y_min,
+        },
+        "confidence": confidence,
+        "method": "edges"
+    }
+
+
+def _auto_canny(gray, sigma=0.33):
+    median = float(np.median(gray))
+    low  = int(max(0,   (1.0 - sigma) * median))
+    high = int(min(255, (1.0 + sigma) * median))
+    return cv2.Canny(gray, low, high)
+
+
+def detect_document_edges(img: np.ndarray) -> tuple[Optional[list[list[float]]], float]:
+    """
+    Edge-based document detection. Returns tuple (corners, confidence) or (None, 0.0)
+    if no plausible quadrilateral found.
+
+    Why: Fallback corner detection when text-region detection fails or gives
+         suspect aspect ratio. Implements jscanify-style edge-detection algorithm.
+    
+    What:
+      1. Convert to grayscale; apply Gaussian blur (5x5).
+      2. Try two edge detection methods: auto-Canny (sigma=0.33) and adaptive threshold.
+      3. Dilate edges to close small gaps.
+      4. Find external contours.
+      5. For each contour, approximate to polygon with epsilon=2% of perimeter.
+      6. Filter to quadrilaterals (4 vertices) with area 30-92% of image.
+      7. Filter by center offset (max 60% of image diagonal from center).
+      8. Pick candidate with highest confidence.
+      9. Order corners as TL/TR/BR/BL using sum/diff heuristic.
+      10. Return corners + confidence.
+
+    NOTE: This function does NOT filter by receipt aspect ratio. The projected
+    shape in image space can be near-square for tilted receipts. Aspect filtering
+    happens AFTER perspective warp in the main pipeline.
+
+    Returns: (corners, confidence) where corners is None if no valid quad found.
+    """
+    H, W = img.shape[:2]
+    img_area = float(H * W)
+    img_cx, img_cy = W / 2.0, H / 2.0
+    img_diag = (W**2 + H**2) ** 0.5
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    candidates = []
+    for method_name, edge_map in [
+        ("canny",    _auto_canny(blurred)),
+        ("adaptive", cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2,
+        )),
+    ]:
+        dilated = cv2.dilate(edge_map, np.ones((3, 3), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) != 4:
+                continue
+            pts = approx.reshape(4, 2).astype(float)
+            area = cv2.contourArea(approx)
+            area_ratio = area / img_area
+            if area_ratio < 0.005 or area_ratio > 0.95:
+                continue
+            cx, cy = pts.mean(axis=0)
+            dist = ((cx - img_cx)**2 + (cy - img_cy)**2) ** 0.5
+            center_offset = dist / (img_diag / 2.0)
+            if center_offset > 0.6:
+                continue
+            confidence = float(area_ratio * max(0.0, 1.0 - 1.5 * center_offset))
+            candidates.append({
+                "pts": pts, "area_ratio": float(area_ratio),
+                "center_offset": float(center_offset),
+                "confidence": confidence, "method": method_name,
+            })
+
+    if not candidates:
+        return None, 0.0
+
+    best = max(candidates, key=lambda c: c["confidence"])
+    pts = best["pts"]
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).flatten()
+    tl = pts[int(np.argmin(s))]
+    br = pts[int(np.argmax(s))]
+    tr = pts[int(np.argmin(d))]
+    bl = pts[int(np.argmax(d))]
+    ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+    confidence = best["confidence"]
+
+    return ordered.tolist(), confidence
+
+
+
+def _order_corners(pts: list[list[float]]) -> np.ndarray:
+    """
+    Why: cv2.getPerspectiveTransform requires corners in a consistent TL/TR/BR/BL
+         order; caller-supplied polygons may be in any winding order.
+    What: Sorts the four input points by the sum-of-coordinates heuristic:
+          TL has the smallest sum (x+y), BR has the largest; TR has the largest
+          difference (x-y), BL has the smallest.  Returns a (4,2) float32 array
+          in [TL, TR, BR, BL] order.
+    Test: Pass [[100,100],[800,100],[800,1200],[100,1200]] in shuffled order;
+          assert result[0]==[100,100] (TL) and result[2]==[800,1200] (BR).
+    """
+    pts_np = np.array(pts, dtype=np.float32)
+    sums = pts_np.sum(axis=1)        # x+y
+    diffs = pts_np[:, 0] - pts_np[:, 1]  # x-y
+
+    tl = pts_np[np.argmin(sums)]
+    br = pts_np[np.argmax(sums)]
+    tr = pts_np[np.argmax(diffs)]
+    bl = pts_np[np.argmin(diffs)]
+
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def _euclidean(p1: np.ndarray, p2: np.ndarray) -> float:
+    return float(np.linalg.norm(p1 - p2))
+
+
+def _is_degenerate(ordered: np.ndarray) -> bool:
+    """
+    Why: A degenerate quadrilateral (colinear or near-zero area) would produce a
+         singular transform matrix and a nonsensical output image.
+    What: Checks that the computed output width and height are both >= 10px, and
+          that the cross-product area of the quad is above a minimum threshold.
+    Test: Pass four colinear points; assert returns True.
+    """
+    tl, tr, br, bl = ordered
+    w = max(_euclidean(tl, tr), _euclidean(bl, br))
+    h = max(_euclidean(tl, bl), _euclidean(tr, br))
+    if w < 10 or h < 10:
+        return True
+    # Cross-product area check (shoelace)
+    pts = ordered
+    area = 0.5 * abs(
+        (pts[0][0] * pts[1][1] - pts[1][0] * pts[0][1]) +
+        (pts[1][0] * pts[2][1] - pts[2][0] * pts[1][1]) +
+        (pts[2][0] * pts[3][1] - pts[3][0] * pts[2][1]) +
+        (pts[3][0] * pts[0][1] - pts[0][0] * pts[3][1])
+    )
+    return area < 100.0
+
+
+async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[float]]], str]:
+    """
+    Why: Shared corner-detection logic with fallback strategy: try text-region detection
+         first, then edge-based if text fails or aspect ratio is suspect.
+    What:
+      1. Try PaddleOCR text regions → compute bbox with 15% padding.
+      2. Check bbox aspect ratio: if 1.2 <= h/w <= 3.5 AND area > 30% of image → return text.
+      3. Else try edge-based (Canny) detection.
+      4. If edge detection returns a valid quad with sane aspect → return edges.
+      5. Else fall back to full image.
+    Returns: (corners, status) where status in ["text", "edges", "fallback"].
+    """
+    if "paddleocr" not in ENABLED_ENGINES:
+        return None, "paddleocr-disabled"
+
+    # Step 1: Try text-region detection
+    success_encode, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not success_encode:
+        return None, "encode-failed"
+
+    image_bytes = buf.tobytes()
+    result = await call_engine("paddleocr", image_bytes)
+
+    if result.error:
+        return None, f"engine-error:{result.error[:20]}"
+
+    if not result.regions:
+        # No text detected; try edge-based
+        edge_corners, edge_conf = detect_document_edges(img)
+        if edge_corners is not None:
+            return edge_corners, "edges"
+        return None, "no-regions"
+
+    # Collect text region polygons
+    points = []
+    for region in result.regions:
+        points.extend(region.polygon)
+
+    if len(points) < 4:
+        # Insufficient text points; try edge-based
+        edge_corners, edge_conf = detect_document_edges(img)
+        if edge_corners is not None:
+            return edge_corners, "edges"
+        return None, "insufficient-points"
+
+    points_np = np.array(points, dtype=np.float32)
+    x_min, y_min = points_np.min(axis=0)
+    x_max, y_max = points_np.max(axis=0)
+
+    # Pad by 15% to capture margins outside text
+    pad_x = (x_max - x_min) * 0.15
+    pad_y = (y_max - y_min) * 0.15
+    x_min = max(0, x_min - pad_x)
+    y_min = max(0, y_min - pad_y)
+    x_max = x_max + pad_x
+    y_max = y_max + pad_y
+
+    # Step 2: Sanity check text-region aspect
+    text_w = x_max - x_min
+    text_h = y_max - y_min
+    text_aspect = text_h / max(text_w, 1)
+    text_area_ratio = (text_w * text_h) / (img.shape[0] * img.shape[1])
+
+    text_corners = [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]]
+
+    # Accept text if aspect is sane and covers enough of image
+    if 1.2 <= text_aspect <= 3.5 and text_area_ratio > 0.30:
+        return text_corners, "text"
+
+    # Step 3: Text aspect suspect; try edge-based
+    edge_corners, edge_conf = detect_document_edges(img)
+    if edge_corners is not None:
+        return edge_corners, "edges"
+
+    # Step 4: Fall back to full image
+    h, w = img.shape[:2]
+    return [[0, 0], [w, 0], [w, h], [0, h]], "fallback"
+
+
+@app.post("/correct")
+async def correct_document(
+    file: UploadFile = File(...),
+    corners_json: Optional[str] = Form(default=None),
+):
+    """
+    Why: Receipts-web needs a flat, axis-aligned image for OCR; a scanned receipt
+         photographed at an angle requires perspective rectification before reliable
+         text extraction is possible.
+    What: NEW ALGORITHM (orient → re-detect → crop):
+          1. Read image bytes and decode.
+          2. Apply EXIF auto-orient via PIL.ImageOps.exif_transpose.
+          3. Run Tesseract OSD to detect document orientation (90/180/270 degrees).
+          4. Re-detect corners on the oriented image (ignore caller-supplied corners).
+          5. Compute perspective transform and warp.
+          6. If corners came from edges and output is landscape, rotate 90 CW to portrait.
+          Note: corners_json is ignored (logged as warning); behavior is fully internal.
+    Test: POST a sideways receipt → assert response has portrait dimensions
+          and all 4 orientations produce similar-sized portrait output.
+    """
+    image_bytes = await file.read()
+
+    # WARN if caller supplied corners (we're ignoring them now)
+    if corners_json is not None:
+        logger.warning("ignoring caller-supplied corners; re-detecting after orient")
+
+    # Step 1: EXIF auto-orient
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        pil_img = ImageOps.exif_transpose(pil_img)
+        img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        logger.warning(f"EXIF transpose failed: {e}, falling back to preprocess_image")
+        clean_bytes = preprocess_image(image_bytes)
+        arr = np.frombuffer(clean_bytes, np.uint8)
+        img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_cv is None:
+            raise HTTPException(status_code=422, detail={"error": "could not decode image"})
+
+    h_orig, w_orig = img_cv.shape[:2]
+
+    # Step 2: OSD auto-orient
+    pre_crop_rotation = 0
+    osd_confidence = 0.0
+
+    try:
+        pil_osd = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        osd = pytesseract.image_to_osd(pil_osd, output_type=pytesseract.Output.DICT)
+        osd_rotate_raw = int(osd.get("rotate", 0))  # CCW degrees
+        osd_confidence = float(osd.get("orientation_conf", 0.0))
+
+        # OSD confidence below ~3 is unreliable (often produces wrong direction).
+        # Below threshold we fall back to aspect-ratio heuristic which only rotates
+        # when the image is clearly wider than tall.
+        if osd_confidence > 3.0 and osd_rotate_raw in (90, 180, 270):
+            pre_crop_rotation = osd_rotate_raw
+        elif img_cv.shape[0] < img_cv.shape[1]:
+            # Wider than tall (w > h) → likely sideways receipt, rotate 90 CW
+            pre_crop_rotation = 90
+        # else: no rotation
+    except Exception as e:
+        logger.warning(f"OSD detection failed: {e}")
+        # Check aspect ratio fallback
+        if img_cv.shape[0] < img_cv.shape[1]:
+            pre_crop_rotation = 90
+
+    # Apply the rotation
+    if pre_crop_rotation == 90:
+        img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
+    elif pre_crop_rotation == 180:
+        img_cv = cv2.rotate(img_cv, cv2.ROTATE_180)
+    elif pre_crop_rotation == 270:
+        img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # Step 3: Re-detect corners on the now-oriented image
+    detected_corners, redetect_status = await detect_corners_internal(img_cv)
+    
+    # Sanity check: if detected region has extreme aspect, fall back to full image
+    # Rationale: a real receipt should have height/width ratio between 1.2 and 3.5
+    # If outside that range, corner detection produced suspect results
+    if detected_corners is not None:
+        det_x_coords = [c[0] for c in detected_corners]
+        det_y_coords = [c[1] for c in detected_corners]
+        det_w = max(det_x_coords) - min(det_x_coords)
+        det_h = max(det_y_coords) - min(det_y_coords)
+        det_ratio = det_h / max(det_w, 1)
+        
+        if det_ratio > 3.5 or det_ratio < 1.2:
+            logger.warning(f"aspect sanity failed: ratio={det_ratio:.2f} outside [1.2, 3.5]; using full image")
+            h, w = img_cv.shape[:2]
+            detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
+            redetect_status = "fallback-extreme-aspect"
+            
+            # Additional fix: if current image is landscape after orientation,
+            # rotate 90 CW to produce portrait output (typical receipt orientation)
+            if w > h:
+                logger.warning(f"fallback produced landscape ({w}x{h}); rotating 90 CW to portrait")
+                img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
+                h, w = img_cv.shape[:2]
+                detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
+                redetect_status = "fallback-extreme-aspect-rotated"
+
+    if detected_corners is None:
+        # No detection: use full image as bbox
+        h, w = img_cv.shape[:2]
+        detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
+        redetect_status = "none"
+
+    # Step 4: Order corners and apply perspective warp
+    ordered = _order_corners(detected_corners)
+
+    if _is_degenerate(ordered):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "degenerate quadrilateral: corners are colinear or cover too small an area"},
+        )
+
+    tl, tr, br, bl = ordered
+
+    # Compute output dimensions
+    width_top = _euclidean(tl, tr)
+    width_bot = _euclidean(bl, br)
+    out_w = int(max(width_top, width_bot))
+
+    height_left = _euclidean(tl, bl)
+    height_right = _euclidean(tr, br)
+    out_h = int(max(height_left, height_right))
+
+    # Sanity check: warn if output is suspiciously wide
+    if out_w > out_h * 1.5:
+        logger.warning(f"output is very wide ({out_w}x{out_h}); check corner detection")
+
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype=np.float32,
+    )
+
+    M = cv2.getPerspectiveTransform(ordered, dst)
+    warped = cv2.warpPerspective(img_cv, M, (out_w, out_h))
+
+    # Encode as JPEG q=90
+    success, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not success:
+        raise HTTPException(status_code=500, detail={"error": "JPEG encoding failed"})
+
+    jpeg_bytes = buf.tobytes()
+
+    # Explain rotation decision in header
+    if pre_crop_rotation and osd_confidence > 3.0:
+        osd_reason = f"osd:{pre_crop_rotation} (conf={osd_confidence:.2f})"
+    elif pre_crop_rotation and osd_confidence <= 3.0:
+        osd_reason = f"aspect-fallback:{pre_crop_rotation} (osd_low={osd_confidence:.2f})"
+    else:
+        osd_reason = f"none (osd_low={osd_confidence:.2f}, aspect_ok)"
+
+    return Response(
+        content=jpeg_bytes,
+        media_type="image/jpeg",
+        headers={
+            "X-Pipeline": "orient-redetect-crop",
+            "X-Detection-Method": redetect_status,
+            "X-Pre-Crop-Rotation": str(pre_crop_rotation),
+            "X-OSD-Reason": osd_reason,
+            "X-OSD-Confidence": f"{osd_confidence:.2f}",
+            "X-Redetect-Status": redetect_status,
+            "X-Output-Width": str(out_w),
+            "X-Output-Height": str(out_h),
+        },
+    )
 
 
 @app.get("/health")
