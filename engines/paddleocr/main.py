@@ -80,12 +80,21 @@ async def ocr(file: UploadFile = File(...)):
                         text_conf = line[1]
                         text = text_conf[0]
                         conf = float(text_conf[1])
+                        # With use_angle_cls=True, cls output is line[2]: (angle, angle_confidence)
+                        angle = 0
+                        angle_confidence = 0.0
+                        if len(line) > 2 and line[2]:
+                            angle_info = line[2]
+                            angle = int(angle_info[0]) if angle_info[0] is not None else 0
+                            angle_confidence = float(angle_info[1]) if angle_info[1] is not None else 0.0
                         lines.append(text)
                         confidences.append(conf)
                         regions.append({
                             "polygon": box,
                             "text": text,
-                            "confidence": conf
+                            "confidence": conf,
+                            "angle": angle,
+                            "angle_confidence": angle_confidence
                         })
 
         text = "\n".join(lines).strip()

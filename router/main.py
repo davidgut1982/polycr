@@ -622,6 +622,70 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     return [[0, 0], [w, 0], [w, h], [0, h]], "fallback"
 
 
+def _orientation_vote(regions, image_shape):
+    """
+    Aggregate per-region orientation predictions from PaddleOCR cls.
+    Returns (rotation_degrees, confidence) where rotation_degrees is
+    0 (no rotation needed) or 180 (rotate 180), and confidence is
+    the area-weighted average of cls confidences for the winning angle.
+
+    For 90-degree rotations, cls only returns 0/180 — those are caught
+    by aspect-shape and PaddleOCR's region polygon orientation
+    (long-axis of polygons running horizontal vs vertical).
+    """
+    if not regions:
+        return 0, 0.0
+
+    # Vote on 0 vs 180
+    vote_0 = 0.0
+    vote_180 = 0.0
+    for r in regions:
+        # Area of polygon using shoelace formula
+        pts = np.array(r.polygon, dtype=np.float32)
+        if len(pts) < 4:
+            continue
+        xs = pts[:, 0]
+        ys = pts[:, 1]
+        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+        weight = area * max(r.angle_confidence, 0.0)
+        if r.angle == 0:
+            vote_0 += weight
+        elif r.angle == 180:
+            vote_180 += weight
+
+    total = vote_0 + vote_180
+    if total == 0:
+        return 0, 0.0
+
+    if vote_180 > vote_0:
+        return 180, vote_180 / total
+    return 0, vote_0 / total
+
+
+def _detect_text_axis(regions):
+    """
+    Returns 'horizontal' or 'vertical' based on dominant text-line orientation.
+    If most polygons have height > width, text is running vertical (receipt rotated 90°).
+    """
+    if not regions:
+        return 'horizontal'
+    h_count = 0
+    v_count = 0
+    for r in regions:
+        pts = np.array(r.polygon, dtype=np.float32)
+        if len(pts) < 4:
+            continue
+        xs = pts[:, 0]
+        ys = pts[:, 1]
+        w = max(xs) - min(xs)
+        h = max(ys) - min(ys)
+        if w >= h:
+            h_count += 1
+        else:
+            v_count += 1
+    return 'vertical' if v_count > h_count else 'horizontal'
+
+
 @app.post("/correct")
 async def correct_document(
     file: UploadFile = File(...),
@@ -631,20 +695,23 @@ async def correct_document(
     Why: Receipts-web needs a flat, axis-aligned image for OCR; a scanned receipt
          photographed at an angle requires perspective rectification before reliable
          text extraction is possible.
-    What: NEW ALGORITHM (orient → re-detect → crop):
+    What: NEW ALGORITHM (PaddleOCR cls orientation):
           1. Read image bytes and decode.
           2. Apply EXIF auto-orient via PIL.ImageOps.exif_transpose.
-          3. Run Tesseract OSD to detect document orientation (90/180/270 degrees).
-          4. Re-detect corners on the oriented image (ignore caller-supplied corners).
-          5. Compute perspective transform and warp.
-          6. If corners came from edges and output is landscape, rotate 90 CW to portrait.
-          Note: corners_json is ignored (logged as warning); behavior is fully internal.
+          3. Run PaddleOCR to detect text regions and per-region orientation (cls).
+          4. Detect 90-degree rotations via _detect_text_axis (polygon shape analysis).
+          5. If 90° rotation needed, apply it and re-run PaddleOCR.
+          6. Re-detect corners on the oriented image.
+          7. Compute perspective transform and warp.
+          8. Post-warp: run PaddleOCR cls vote to detect 180-degree rotation.
+          9. Apply 180-degree rotation if cls vote confidence > 0.7.
+          Removes: Tesseract OSD pass 1, OSD pass 2, OCR-vote tiers.
+          Retains: EXIF auto-orient, aspect-fallback heuristic (last resort).
     Test: POST a sideways receipt → assert response has portrait dimensions
           and all 4 orientations produce similar-sized portrait output.
     """
     image_bytes = await file.read()
 
-    # WARN if caller supplied corners (we're ignoring them now)
     if corners_json is not None:
         logger.warning("ignoring caller-supplied corners; re-detecting after orient")
 
@@ -662,61 +729,42 @@ async def correct_document(
             raise HTTPException(status_code=422, detail={"error": "could not decode image"})
 
     h_orig, w_orig = img_cv.shape[:2]
+    rotation_method = "none"
+    text_axis_pre_warp = "horizontal"
 
-    # Step 2: OSD auto-orient
-    pre_crop_rotation = 0
-    osd_confidence = 0.0
-
+    # Step 2: Pre-warp orientation correction using PaddleOCR cls + text-axis detection
+    pre_warp_rotation = 0
     try:
-        pil_osd = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-        osd = pytesseract.image_to_osd(pil_osd, output_type=pytesseract.Output.DICT)
-        osd_rotate_raw = int(osd.get("rotate", 0))  # CCW degrees
-        osd_confidence = float(osd.get("orientation_conf", 0.0))
-
-        # OSD confidence below ~3 is unreliable (often produces wrong direction).
-        # Below threshold we fall back to aspect-ratio heuristic which only rotates
-        # when the image is clearly wider than tall.
-        if osd_confidence > 3.0 and osd_rotate_raw in (90, 180, 270):
-            pre_crop_rotation = osd_rotate_raw
-        elif img_cv.shape[0] < img_cv.shape[1]:
-            # Wider than tall (w > h) → likely sideways receipt, rotate 90 CW
-            pre_crop_rotation = 90
-        # else: no rotation
+        success_encode, buf = cv2.imencode(".jpg", img_cv, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if success_encode:
+            img_bytes_encoded = buf.tobytes()
+            result = await call_engine("paddleocr", img_bytes_encoded)
+            if not result.error and result.regions:
+                text_axis_pre_warp = _detect_text_axis(result.regions)
+                if text_axis_pre_warp == 'vertical':
+                    pre_warp_rotation = 90
+                    img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
+                    logger.info(f"pre-warp: detected vertical text axis, rotating 90 CW")
     except Exception as e:
-        logger.warning(f"OSD detection failed: {e}")
-        # Check aspect ratio fallback
-        if img_cv.shape[0] < img_cv.shape[1]:
-            pre_crop_rotation = 90
-
-    # Apply the rotation
-    if pre_crop_rotation == 90:
-        img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
-    elif pre_crop_rotation == 180:
-        img_cv = cv2.rotate(img_cv, cv2.ROTATE_180)
-    elif pre_crop_rotation == 270:
-        img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        logger.warning(f"pre-warp PaddleOCR detection failed: {e}")
 
     # Step 3: Re-detect corners on the now-oriented image
     detected_corners, redetect_status = await detect_corners_internal(img_cv)
-    
+
     # Sanity check: if detected region has extreme aspect, fall back to full image
-    # Rationale: a real receipt should have height/width ratio between 1.2 and 3.5
-    # If outside that range, corner detection produced suspect results
     if detected_corners is not None:
         det_x_coords = [c[0] for c in detected_corners]
         det_y_coords = [c[1] for c in detected_corners]
         det_w = max(det_x_coords) - min(det_x_coords)
         det_h = max(det_y_coords) - min(det_y_coords)
         det_ratio = det_h / max(det_w, 1)
-        
+
         if det_ratio > 4.5 or det_ratio < 1.2:
             logger.warning(f"aspect sanity failed: ratio={det_ratio:.2f} outside [1.2, 4.5]; using full image")
             h, w = img_cv.shape[:2]
             detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
             redetect_status = "fallback-extreme-aspect"
-            
-            # Additional fix: if current image is landscape after orientation,
-            # rotate 90 CW to produce portrait output (typical receipt orientation)
+
             if w > h:
                 logger.warning(f"fallback produced landscape ({w}x{h}); rotating 90 CW to portrait")
                 img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
@@ -725,7 +773,6 @@ async def correct_document(
                 redetect_status = "fallback-extreme-aspect-rotated"
 
     if detected_corners is None:
-        # No detection: use full image as bbox
         h, w = img_cv.shape[:2]
         detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
         redetect_status = "none"
@@ -750,7 +797,6 @@ async def correct_document(
     height_right = _euclidean(tr, br)
     out_h = int(max(height_left, height_right))
 
-    # Sanity check: warn if output is suspiciously wide
     if out_w > out_h * 1.5:
         logger.warning(f"output is very wide ({out_w}x{out_h}); check corner detection")
 
@@ -762,31 +808,32 @@ async def correct_document(
     M = cv2.getPerspectiveTransform(ordered, dst)
     warped = cv2.warpPerspective(img_cv, M, (out_w, out_h))
 
-    # === Second-pass OSD on the warped output ===
-    # OSD on the raw photo is unreliable when receipt is small in a busy frame.
-    # OSD on the cleanly-warped output is much more reliable; if it disagrees
-    # with the first pass orientation, apply additional rotation here.
-    rotation_deg2 = 0
-    osd2_confidence = 0.0
+    # Step 5: Post-warp orientation refinement using PaddleOCR cls vote
+    cls_vote_rotation = 0
+    cls_vote_confidence = 0.0
     try:
-        pil_warped = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
-        osd2 = pytesseract.image_to_osd(pil_warped, output_type=pytesseract.Output.DICT)
-        rotation_deg2 = int(osd2.get('rotate', 0))
-        osd2_confidence = float(osd2.get('orientation_conf', 0.0))
+        success_encode, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if success_encode:
+            img_bytes_warped = buf.tobytes()
+            result = await call_engine("paddleocr", img_bytes_warped)
+            if not result.error and result.regions:
+                cls_vote_rotation, cls_vote_confidence = _orientation_vote(result.regions, warped.shape)
+                if cls_vote_rotation == 180 and cls_vote_confidence > 0.7:
+                    warped = cv2.rotate(warped, cv2.ROTATE_180)
+                    logger.info(f"post-warp cls vote: applied 180° rotation (conf={cls_vote_confidence:.2f})")
+                    rotation_method = "cls"
+                elif pre_warp_rotation == 90:
+                    rotation_method = "aspect"
+                else:
+                    rotation_method = "none" if cls_vote_confidence < 0.5 else "cls-low-conf"
     except Exception as e:
-        logger.warning(f"second-pass OSD failed: {e}")
-        rotation_deg2 = 0
-        osd2_confidence = 0.0
+        logger.warning(f"post-warp PaddleOCR cls vote failed: {e}")
+        if pre_warp_rotation == 90:
+            rotation_method = "aspect"
 
-    # Threshold: same 3.0 as first pass
-    if osd2_confidence > 3.0 and rotation_deg2 in (90, 180, 270):
-        if rotation_deg2 == 90:
-            warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
-        elif rotation_deg2 == 180:
-            warped = cv2.rotate(warped, cv2.ROTATE_180)
-        elif rotation_deg2 == 270:
-            warped = cv2.rotate(warped, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        logger.info(f"second-pass OSD rotated {rotation_deg2}deg (conf={osd2_confidence:.2f})")
+    # Fallback rotation_method detection
+    if rotation_method == "none" and pre_warp_rotation == 90:
+        rotation_method = "aspect"
 
     # Encode as JPEG q=90
     success, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -795,26 +842,17 @@ async def correct_document(
 
     jpeg_bytes = buf.tobytes()
 
-    # Explain rotation decision in header
-    if pre_crop_rotation and osd_confidence > 3.0:
-        osd_reason = f"osd:{pre_crop_rotation} (conf={osd_confidence:.2f})"
-    elif pre_crop_rotation and osd_confidence <= 3.0:
-        osd_reason = f"aspect-fallback:{pre_crop_rotation} (osd_low={osd_confidence:.2f})"
-    else:
-        osd_reason = f"none (osd_low={osd_confidence:.2f}, aspect_ok)"
-
     return Response(
         content=jpeg_bytes,
         media_type="image/jpeg",
         headers={
-            "X-Pipeline": "orient-redetect-crop",
+            "X-Pipeline": "paddleocr-cls-orient",
             "X-Detection-Method": redetect_status,
-            "X-Pre-Crop-Rotation": str(pre_crop_rotation),
-            "X-OSD-Reason": osd_reason,
-            "X-OSD-Confidence": f"{osd_confidence:.2f}",
-            "X-Redetect-Status": redetect_status,
-            "X-OSD2-Rotation": str(rotation_deg2),
-            "X-OSD2-Confidence": f"{osd2_confidence:.2f}",
+            "X-Text-Axis-Pre-Warp": text_axis_pre_warp,
+            "X-Pre-Warp-Rotation": str(pre_warp_rotation),
+            "X-Cls-Vote-180": str(cls_vote_rotation),
+            "X-Cls-Vote-Confidence": f"{cls_vote_confidence:.2f}",
+            "X-Rotation-Method": rotation_method,
             "X-Output-Width": str(out_w),
             "X-Output-Height": str(out_h),
         },
