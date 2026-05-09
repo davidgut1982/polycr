@@ -1,0 +1,6 @@
+{
+  "scenario": "thin-strip",
+  "must_be_portrait": true,
+  "aspect_min": 1.0,
+  "aspect_max": 5.0
+}
