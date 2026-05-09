@@ -469,6 +469,9 @@ def detect_corners_docaligner(img: np.ndarray) -> Optional[list[list[float]]]:
         aligner = _get_docaligner()
         result = aligner(img)
         if result is None or len(result) != 4:
+            # Reject partial detections (e.g., only 2 corners from low-contrast images)
+            if result is not None and len(result) < 4:
+                logger.warning(f"DocAligner returned only {len(result)} corners (need 4); rejecting")
             return None
         # result is Nx2 numpy array; convert to list of [x, y] pairs
         corners = result.tolist()
@@ -636,6 +639,7 @@ async def correct_document(
             raise HTTPException(status_code=422, detail={"error": "could not decode image"})
 
     rotation_method = "none"
+    post_warp_rotation = 0  # Track any rotation applied after warp
 
     # Step 2: Detect corners on the EXIF-oriented image
     detected_corners, redetect_status = await detect_corners_internal(img_cv)
@@ -648,7 +652,9 @@ async def correct_document(
         det_h = max(det_y_coords) - min(det_y_coords)
         det_ratio = det_h / max(det_w, 1)
 
-        if det_ratio > 4.5 or det_ratio < 1.2:
+        # Only reject extreme aspect if NOT from DocAligner (DocAligner wide → rotate post-warp)
+        is_docaligner = redetect_status and redetect_status.startswith("docaligner")
+        if not is_docaligner and (det_ratio > 4.5 or det_ratio < 1.2):
             logger.warning(f"aspect sanity failed: ratio={det_ratio:.2f} outside [1.2, 4.5]; using full image")
             h, w = img_cv.shape[:2]
             detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
@@ -660,6 +666,7 @@ async def correct_document(
                 h, w = img_cv.shape[:2]
                 detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
                 redetect_status = "fallback-extreme-aspect-rotated"
+                post_warp_rotation = 90
 
     if detected_corners is None:
         h, w = img_cv.shape[:2]
@@ -697,6 +704,18 @@ async def correct_document(
     M = cv2.getPerspectiveTransform(ordered, dst)
     warped = cv2.warpPerspective(img_cv, M, (out_w, out_h))
 
+    # Post-warp aspect handling: if DocAligner detection produced wide output, rotate to portrait
+    is_docaligner = redetect_status and redetect_status.startswith("docaligner")
+    if is_docaligner and out_w > out_h:
+        warp_aspect = out_h / max(out_w, 1)
+        if warp_aspect < 1.0:
+            logger.info(f"DocAligner wide output ({out_w}x{out_h}, aspect={warp_aspect:.2f}); rotating 90 CW to portrait")
+            warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+            out_h_new, out_w_new = warped.shape[:2]
+            out_w, out_h = out_w_new, out_h_new
+            post_warp_rotation = 90
+            redetect_status = "docaligner-wide-rotated"
+
     # Step 3: Encode as JPEG q=90
     success, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not success:
@@ -715,16 +734,20 @@ async def correct_document(
     elif redetect_status == "fallback" or redetect_status == "fallback-extreme-aspect":
         detection_source = "fallback"
 
+    headers_dict = {
+        "X-Pipeline": "docaligner-primary",
+        "X-Detection-Source": detection_source,
+        "X-Detection-Method": redetect_status,
+        "X-Output-Width": str(out_w),
+        "X-Output-Height": str(out_h),
+    }
+    if post_warp_rotation > 0:
+        headers_dict["X-Post-Warp-Rotation"] = str(post_warp_rotation)
+
     return Response(
         content=jpeg_bytes,
         media_type="image/jpeg",
-        headers={
-            "X-Pipeline": "docaligner-primary",
-            "X-Detection-Source": detection_source,
-            "X-Detection-Method": redetect_status,
-            "X-Output-Width": str(out_w),
-            "X-Output-Height": str(out_h),
-        },
+        headers=headers_dict,
     )
 
 
