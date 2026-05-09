@@ -762,6 +762,32 @@ async def correct_document(
     M = cv2.getPerspectiveTransform(ordered, dst)
     warped = cv2.warpPerspective(img_cv, M, (out_w, out_h))
 
+    # === Second-pass OSD on the warped output ===
+    # OSD on the raw photo is unreliable when receipt is small in a busy frame.
+    # OSD on the cleanly-warped output is much more reliable; if it disagrees
+    # with the first pass orientation, apply additional rotation here.
+    rotation_deg2 = 0
+    osd2_confidence = 0.0
+    try:
+        pil_warped = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+        osd2 = pytesseract.image_to_osd(pil_warped, output_type=pytesseract.Output.DICT)
+        rotation_deg2 = int(osd2.get('rotate', 0))
+        osd2_confidence = float(osd2.get('orientation_conf', 0.0))
+    except Exception as e:
+        logger.warning(f"second-pass OSD failed: {e}")
+        rotation_deg2 = 0
+        osd2_confidence = 0.0
+
+    # Threshold: same 3.0 as first pass
+    if osd2_confidence > 3.0 and rotation_deg2 in (90, 180, 270):
+        if rotation_deg2 == 90:
+            warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_deg2 == 180:
+            warped = cv2.rotate(warped, cv2.ROTATE_180)
+        elif rotation_deg2 == 270:
+            warped = cv2.rotate(warped, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        logger.info(f"second-pass OSD rotated {rotation_deg2}deg (conf={osd2_confidence:.2f})")
+
     # Encode as JPEG q=90
     success, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not success:
@@ -787,6 +813,8 @@ async def correct_document(
             "X-OSD-Reason": osd_reason,
             "X-OSD-Confidence": f"{osd_confidence:.2f}",
             "X-Redetect-Status": redetect_status,
+            "X-OSD2-Rotation": str(rotation_deg2),
+            "X-OSD2-Confidence": f"{osd2_confidence:.2f}",
             "X-Output-Width": str(out_w),
             "X-Output-Height": str(out_h),
         },
