@@ -27,6 +27,7 @@ import pytesseract
 from PIL import Image
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import Response
+from docaligner import DocAligner
 
 from llm import reconcile
 from models import EngineResult, ProcessResponse
@@ -37,6 +38,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ENABLED_ENGINES = os.getenv("ENABLED_ENGINES", "tesseract,easyocr,doctr").split(",")
+
+# Initialize DocAligner model (lazy-loaded on first inference)
+_docaligner = None
+
+def _get_docaligner():
+    """Lazy-load DocAligner singleton."""
+    global _docaligner
+    if _docaligner is None:
+        _docaligner = DocAligner()
+    return _docaligner
 
 app = FastAPI(
     title="polycr",
@@ -527,22 +538,60 @@ def _cluster_score(cluster, image_area: float) -> float:
     return n_regions * aspect_bonus * (1.0 + min(density * 1e6, 5.0))
 
 
+def detect_corners_docaligner(img: np.ndarray) -> Optional[list[list[float]]]:
+    """
+    Why: Purpose-built CNN for document corner detection. Returns ordered corners
+         (TL, TR, BR, BL) that encode orientation by construction.
+    What: Runs DocAligner heatmap regression model on BGR image, returns 4 corners
+          in original image coordinates, or None if no document detected.
+    Test: Pass a receipt image; expect 4 [x, y] points within image bounds.
+    """
+    try:
+        aligner = _get_docaligner()
+        result = aligner(img)
+        if result is None or len(result) != 4:
+            return None
+        # result is Nx2 numpy array; convert to list of [x, y] pairs
+        corners = result.tolist()
+        # Sanity: ensure all points within image bounds
+        h, w = img.shape[:2]
+        valid = all(
+            0 <= c[0] <= w and 0 <= c[1] <= h
+            for c in corners
+        )
+        return corners if valid else None
+    except Exception as e:
+        logger.warning(f"DocAligner detection failed: {e}")
+        return None
+
+
 async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[float]]], str]:
     """
-    Why: Shared corner-detection logic with fallback strategy: try text-region detection
-         first, then edge-based if text fails or aspect ratio is suspect.
+    Why: Shared corner-detection logic with DocAligner primary + cluster fallback.
     What:
-      1. Try PaddleOCR text regions → compute bbox with 15% padding.
-      2. Check bbox aspect ratio: if 1.2 <= h/w <= 3.5 AND area > 30% of image → return text.
-      3. Else try edge-based (Canny) detection.
-      4. If edge detection returns a valid quad with sane aspect → return edges.
-      5. Else fall back to full image.
-    Returns: (corners, status) where status in ["text", "edges", "fallback"].
+      1. Try DocAligner CNN first (purpose-built for document corners).
+      2. If DocAligner succeeds, use its ordered corners directly (no separate orientation needed).
+      3. If DocAligner fails, fall back to text-region clustering (PaddleOCR).
+      4. Ensemble: prefer DocAligner; use cluster/edges only when DocAligner returns None.
+    Returns: (corners, status) where status in ["docaligner", "cluster", "edges", "fallback"].
     """
-    if "paddleocr" not in ENABLED_ENGINES:
-        return None, "paddleocr-disabled"
+    h, w = img.shape[:2]
+    image_area = h * w
+    image_diag = (h**2 + w**2) ** 0.5
 
-    # Step 1: Try text-region detection
+    # Step 1: Try DocAligner first (CNN-based document detection)
+    docaligner_corners = detect_corners_docaligner(img)
+    if docaligner_corners is not None:
+        return docaligner_corners, "docaligner"
+
+    # Step 2: Fallback to cluster-based detection (PaddleOCR text regions)
+    if "paddleocr" not in ENABLED_ENGINES:
+        # No DocAligner result and PaddleOCR disabled; try edge-based
+        edge_result = detect_document_edges(img)
+        if edge_result is not None:
+            return edge_result["corners"], "edges"
+        return None, "no-detection-methods"
+
     success_encode, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not success_encode:
         return None, "encode-failed"
@@ -551,6 +600,10 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     result = await call_engine("paddleocr", image_bytes)
 
     if result.error:
+        # PaddleOCR failed; try edge-based
+        edge_result = detect_document_edges(img)
+        if edge_result is not None:
+            return edge_result["corners"], "edges"
         return None, f"engine-error:{result.error[:20]}"
 
     if not result.regions:
@@ -560,13 +613,12 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
             return edge_result["corners"], "edges"
         return None, "no-regions"
 
-    # Step 1.5: Cluster regions by proximity to separate receipt from background
-    h, w = img.shape[:2]
-    image_area = h * w
-    image_diag = (h**2 + w**2) ** 0.5
-
+    # Cluster regions by proximity to separate receipt from background
     clusters = _cluster_regions_by_proximity(result.regions, image_diag)
     if not clusters:
+        edge_result = detect_document_edges(img)
+        if edge_result is not None:
+            return edge_result["corners"], "edges"
         return None, "no-clusters"
 
     # Score each cluster and pick the best
@@ -574,6 +626,9 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     best_cluster = max(cluster_scores, key=lambda x: x[1])[0]
 
     if not best_cluster:
+        edge_result = detect_document_edges(img)
+        if edge_result is not None:
+            return edge_result["corners"], "edges"
         return None, "all-clusters-rejected"
 
     # Collect points only from the best cluster
@@ -582,7 +637,7 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
         points.extend(region.polygon)
 
     if len(points) < 4:
-        # Insufficient text points in best cluster; try edge-based
+        # Insufficient text points; try edge-based
         edge_result = detect_document_edges(img)
         if edge_result is not None:
             return edge_result["corners"], "edges"
@@ -600,7 +655,7 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     x_max = x_max + pad_x
     y_max = y_max + pad_y
 
-    # Step 2: Sanity check text-region aspect
+    # Sanity check cluster aspect
     text_w = x_max - x_min
     text_h = y_max - y_min
     text_aspect = text_h / max(text_w, 1)
@@ -609,16 +664,16 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     text_corners = [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]]
     cluster_status = f"cluster:{len(best_cluster)}:{len(clusters)}"
 
-    # Accept text if aspect is sane and covers enough of image
+    # Accept cluster if aspect is sane and covers enough of image
     if 1.2 <= text_aspect <= 4.5 and text_area_ratio > 0.30:
         return text_corners, cluster_status
 
-    # Step 3: Text aspect suspect; try edge-based
+    # Cluster aspect suspect; try edge-based
     edge_result = detect_document_edges(img)
     if edge_result is not None:
         return edge_result["corners"], "edges"
 
-    # Step 4: Fall back to full image
+    # Fall back to full image
     return [[0, 0], [w, 0], [w, h], [0, h]], "fallback"
 
 
@@ -842,11 +897,23 @@ async def correct_document(
 
     jpeg_bytes = buf.tobytes()
 
+    # Determine detection source from redetect_status
+    detection_source = "unknown"
+    if redetect_status and redetect_status.startswith("docaligner"):
+        detection_source = "docaligner"
+    elif redetect_status and redetect_status.startswith("cluster"):
+        detection_source = "cluster"
+    elif redetect_status == "edges":
+        detection_source = "edges"
+    elif redetect_status == "fallback" or redetect_status == "fallback-extreme-aspect":
+        detection_source = "fallback"
+
     return Response(
         content=jpeg_bytes,
         media_type="image/jpeg",
         headers={
-            "X-Pipeline": "paddleocr-cls-orient",
+            "X-Pipeline": "docaligner-primary",
+            "X-Detection-Source": detection_source,
             "X-Detection-Method": redetect_status,
             "X-Text-Axis-Pre-Warp": text_axis_pre_warp,
             "X-Pre-Warp-Rotation": str(pre_warp_rotation),
