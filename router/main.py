@@ -640,6 +640,7 @@ async def correct_document(
 
     rotation_method = "none"
     post_warp_rotation = 0  # Track any rotation applied after warp
+    is_docaligner = False  # Track detection method for post-warp logic
 
     # Step 2: Detect corners on the EXIF-oriented image
     detected_corners, redetect_status = await detect_corners_internal(img_cv)
