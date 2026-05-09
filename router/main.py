@@ -336,7 +336,7 @@ def detect_document_edges(img: np.ndarray) -> Optional[dict]:
 
         area = cv2.contourArea(approx)
         area_ratio = area / img_area
-        if area_ratio < 0.10 or area_ratio > 0.95:  # relaxed based on real-world data
+        if area_ratio < 0.03 or area_ratio > 0.92:  # relaxed based on real-world data
             continue
 
         cx, cy = pts.mean(axis=0)
