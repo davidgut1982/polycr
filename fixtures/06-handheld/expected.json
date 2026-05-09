@@ -1,6 +1,10 @@
 {
   "scenario": "handheld",
   "must_be_portrait": true,
-  "aspect_min": 1.0,
-  "aspect_max": 5.0
+  "aspect_min": 2.0,
+  "aspect_max": 3.5,
+  "must_be_cropped": true,
+  "expected_detection_source": ["docaligner"],
+  "expected_text_contains": [],
+  "min_text_match_count": 0
 }
