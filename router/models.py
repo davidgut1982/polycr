@@ -18,8 +18,6 @@ class Region(BaseModel):
     polygon: list[list[float]] = []
     text: str = ""
     confidence: float = 0.0
-    angle: int = 0
-    angle_confidence: float = 0.0
 
 
 class EngineResult(BaseModel):

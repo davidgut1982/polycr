@@ -14,16 +14,13 @@ Test: Start the router with at least the tesseract engine running; POST a JPEG t
 
 import asyncio
 import io
-import json
 import logging
-import math
 import os
 from typing import Optional
 
 import cv2
 import httpx
 import numpy as np
-import pytesseract
 from PIL import Image
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import Response
@@ -195,78 +192,6 @@ async def detect_document(file: UploadFile = File(...)):
     }
 
 
-@app.post("/detect-edges")
-async def detect_edges_endpoint(file: UploadFile = File(...)):
-    """
-    Why: Direct edge-based document detection (jscanify-style Canny + contour).
-    What: Reads image, applies EXIF auto-orient, runs Canny edge detection,
-          finds contours, filters to 4-vertex quadrilaterals with sane aspect ratios,
-          and returns corners + confidence based on contour area.
-    Test: POST a receipt photographed at an angle -> expect corners and confidence > 0.5.
-    """
-    image_bytes = await file.read()
-    img_cv = None
-
-    # Try direct PIL EXIF auto-orient first
-    try:
-        pil_img = Image.open(io.BytesIO(image_bytes))
-        pil_img = ImageOps.exif_transpose(pil_img)
-        img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        logger.warning(f"EXIF transpose failed: {e}, trying fallback")
-
-    if img_cv is None:
-        try:
-            clean_bytes = preprocess_image(image_bytes)
-            arr = np.frombuffer(clean_bytes, np.uint8)
-            img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        except Exception as e2:
-            logger.error(f"Both EXIF and preprocess failed: {e2}")
-
-    if img_cv is None:
-        return {
-            "corners": None,
-            "bbox": None,
-            "confidence": 0.0,
-            "error": "could not decode image",
-            "method": "edges"
-        }
-
-    result = detect_document_edges(img_cv)
-
-    if result is None:
-        return {
-            "corners": None,
-            "bbox": None,
-            "confidence": 0.0,
-            "error": "no valid quadrilateral found",
-            "method": "edges"
-        }
-
-    corners = result["corners"]
-    confidence = result["confidence"]
-    method = result.get("method", "edges")
-
-    x_coords = [c[0] for c in corners]
-    y_coords = [c[1] for c in corners]
-    x_min, x_max = min(x_coords), max(x_coords)
-    y_min, y_max = min(y_coords), max(y_coords)
-
-    return {
-        "corners": corners,
-        "bbox": {
-            "x": x_min,
-            "y": y_min,
-            "width": x_max - x_min,
-            "height": y_max - y_min,
-        },
-        "confidence": confidence,
-        "method": method,
-        "area_ratio": result.get("area_ratio", 0.0),
-        "center_offset": result.get("center_offset", 0.0)
-    }
-
-
 def _auto_canny(gray, sigma=0.33):
     median = float(np.median(gray))
     low  = int(max(0,   (1.0 - sigma) * median))
@@ -276,11 +201,10 @@ def _auto_canny(gray, sigma=0.33):
 
 def detect_document_edges(img: np.ndarray) -> Optional[dict]:
     """
-    Edge-based document detection. Returns tuple (corners, confidence) or (None, 0.0)
-    if no plausible quadrilateral found.
+    Edge-based document detection (fallback only). Returns dict with corners or None.
 
-    Why: Fallback corner detection when text-region detection fails or gives
-         suspect aspect ratio. Implements jscanify-style edge-detection algorithm.
+    Why: Fallback corner detection when DocAligner and text-region clustering both fail.
+         Implements jscanify-style edge-detection algorithm.
 
     What:
       1. Convert to grayscale; apply Gaussian blur (5x5).
@@ -289,17 +213,12 @@ def detect_document_edges(img: np.ndarray) -> Optional[dict]:
       4. Find external contours.
       5. For each contour, approximate to polygon with epsilon=0.04 of perimeter.
       6. Reject contours touching image edges (within 5px of boundary).
-      7. Filter to quadrilaterals (4 vertices) with area 30-92% of image (restored to spec).
+      7. Filter to quadrilaterals (4 vertices) with area 30-92% of image.
       8. Filter by center offset (max 60% of image diagonal from center).
       9. Pick candidate with highest confidence.
       10. Order corners as TL/TR/BR/BL using sum/diff heuristic.
-      11. Return corners + confidence + method used (canny or adaptive).
 
-    NOTE: This function does NOT filter by receipt aspect ratio. The projected
-    shape in image space can be near-square for tilted receipts. Aspect filtering
-    happens AFTER perspective warp in the main pipeline.
-
-    Returns: (corners, confidence) where corners is None if no valid quad found.
+    Returns: dict with corners + confidence or None if no valid quad found.
     """
     H, W = img.shape[:2]
     img_area = float(H * W)
@@ -677,70 +596,6 @@ async def detect_corners_internal(img: np.ndarray) -> tuple[Optional[list[list[f
     return [[0, 0], [w, 0], [w, h], [0, h]], "fallback"
 
 
-def _orientation_vote(regions, image_shape):
-    """
-    Aggregate per-region orientation predictions from PaddleOCR cls.
-    Returns (rotation_degrees, confidence) where rotation_degrees is
-    0 (no rotation needed) or 180 (rotate 180), and confidence is
-    the area-weighted average of cls confidences for the winning angle.
-
-    For 90-degree rotations, cls only returns 0/180 — those are caught
-    by aspect-shape and PaddleOCR's region polygon orientation
-    (long-axis of polygons running horizontal vs vertical).
-    """
-    if not regions:
-        return 0, 0.0
-
-    # Vote on 0 vs 180
-    vote_0 = 0.0
-    vote_180 = 0.0
-    for r in regions:
-        # Area of polygon using shoelace formula
-        pts = np.array(r.polygon, dtype=np.float32)
-        if len(pts) < 4:
-            continue
-        xs = pts[:, 0]
-        ys = pts[:, 1]
-        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        weight = area * max(r.angle_confidence, 0.0)
-        if r.angle == 0:
-            vote_0 += weight
-        elif r.angle == 180:
-            vote_180 += weight
-
-    total = vote_0 + vote_180
-    if total == 0:
-        return 0, 0.0
-
-    if vote_180 > vote_0:
-        return 180, vote_180 / total
-    return 0, vote_0 / total
-
-
-def _detect_text_axis(regions):
-    """
-    Returns 'horizontal' or 'vertical' based on dominant text-line orientation.
-    If most polygons have height > width, text is running vertical (receipt rotated 90°).
-    """
-    if not regions:
-        return 'horizontal'
-    h_count = 0
-    v_count = 0
-    for r in regions:
-        pts = np.array(r.polygon, dtype=np.float32)
-        if len(pts) < 4:
-            continue
-        xs = pts[:, 0]
-        ys = pts[:, 1]
-        w = max(xs) - min(xs)
-        h = max(ys) - min(ys)
-        if w >= h:
-            h_count += 1
-        else:
-            v_count += 1
-    return 'vertical' if v_count > h_count else 'horizontal'
-
-
 @app.post("/correct")
 async def correct_document(
     file: UploadFile = File(...),
@@ -750,18 +605,15 @@ async def correct_document(
     Why: Receipts-web needs a flat, axis-aligned image for OCR; a scanned receipt
          photographed at an angle requires perspective rectification before reliable
          text extraction is possible.
-    What: NEW ALGORITHM (PaddleOCR cls orientation):
+    What: SIMPLIFIED ALGORITHM (DocAligner primary, cluster fallback):
           1. Read image bytes and decode.
           2. Apply EXIF auto-orient via PIL.ImageOps.exif_transpose.
-          3. Run PaddleOCR to detect text regions and per-region orientation (cls).
-          4. Detect 90-degree rotations via _detect_text_axis (polygon shape analysis).
-          5. If 90° rotation needed, apply it and re-run PaddleOCR.
-          6. Re-detect corners on the oriented image.
-          7. Compute perspective transform and warp.
-          8. Post-warp: run PaddleOCR cls vote to detect 180-degree rotation.
-          9. Apply 180-degree rotation if cls vote confidence > 0.7.
-          Removes: Tesseract OSD pass 1, OSD pass 2, OCR-vote tiers.
-          Retains: EXIF auto-orient, aspect-fallback heuristic (last resort).
+          3. Detect corners via detect_corners_internal (DocAligner CNN primary,
+             cluster + edges fallbacks).
+          4. Compute perspective transform and warp.
+          5. Return rectified image.
+          Removed: Tesseract OSD, PaddleOCR cls voting, aspect-fallback heuristics.
+          Retains: EXIF auto-orient, DocAligner CNN, cluster-based detection.
     Test: POST a sideways receipt → assert response has portrait dimensions
           and all 4 orientations produce similar-sized portrait output.
     """
@@ -783,27 +635,9 @@ async def correct_document(
         if img_cv is None:
             raise HTTPException(status_code=422, detail={"error": "could not decode image"})
 
-    h_orig, w_orig = img_cv.shape[:2]
     rotation_method = "none"
-    text_axis_pre_warp = "horizontal"
 
-    # Step 2: Pre-warp orientation correction using PaddleOCR cls + text-axis detection
-    pre_warp_rotation = 0
-    try:
-        success_encode, buf = cv2.imencode(".jpg", img_cv, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        if success_encode:
-            img_bytes_encoded = buf.tobytes()
-            result = await call_engine("paddleocr", img_bytes_encoded)
-            if not result.error and result.regions:
-                text_axis_pre_warp = _detect_text_axis(result.regions)
-                if text_axis_pre_warp == 'vertical':
-                    pre_warp_rotation = 90
-                    img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
-                    logger.info(f"pre-warp: detected vertical text axis, rotating 90 CW")
-    except Exception as e:
-        logger.warning(f"pre-warp PaddleOCR detection failed: {e}")
-
-    # Step 3: Re-detect corners on the now-oriented image
+    # Step 2: Detect corners on the EXIF-oriented image
     detected_corners, redetect_status = await detect_corners_internal(img_cv)
 
     # Sanity check: if detected region has extreme aspect, fall back to full image
@@ -863,34 +697,7 @@ async def correct_document(
     M = cv2.getPerspectiveTransform(ordered, dst)
     warped = cv2.warpPerspective(img_cv, M, (out_w, out_h))
 
-    # Step 5: Post-warp orientation refinement using PaddleOCR cls vote
-    cls_vote_rotation = 0
-    cls_vote_confidence = 0.0
-    try:
-        success_encode, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        if success_encode:
-            img_bytes_warped = buf.tobytes()
-            result = await call_engine("paddleocr", img_bytes_warped)
-            if not result.error and result.regions:
-                cls_vote_rotation, cls_vote_confidence = _orientation_vote(result.regions, warped.shape)
-                if cls_vote_rotation == 180 and cls_vote_confidence > 0.7:
-                    warped = cv2.rotate(warped, cv2.ROTATE_180)
-                    logger.info(f"post-warp cls vote: applied 180° rotation (conf={cls_vote_confidence:.2f})")
-                    rotation_method = "cls"
-                elif pre_warp_rotation == 90:
-                    rotation_method = "aspect"
-                else:
-                    rotation_method = "none" if cls_vote_confidence < 0.5 else "cls-low-conf"
-    except Exception as e:
-        logger.warning(f"post-warp PaddleOCR cls vote failed: {e}")
-        if pre_warp_rotation == 90:
-            rotation_method = "aspect"
-
-    # Fallback rotation_method detection
-    if rotation_method == "none" and pre_warp_rotation == 90:
-        rotation_method = "aspect"
-
-    # Encode as JPEG q=90
+    # Step 3: Encode as JPEG q=90
     success, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not success:
         raise HTTPException(status_code=500, detail={"error": "JPEG encoding failed"})
@@ -915,11 +722,6 @@ async def correct_document(
             "X-Pipeline": "docaligner-primary",
             "X-Detection-Source": detection_source,
             "X-Detection-Method": redetect_status,
-            "X-Text-Axis-Pre-Warp": text_axis_pre_warp,
-            "X-Pre-Warp-Rotation": str(pre_warp_rotation),
-            "X-Cls-Vote-180": str(cls_vote_rotation),
-            "X-Cls-Vote-Confidence": f"{cls_vote_confidence:.2f}",
-            "X-Rotation-Method": rotation_method,
             "X-Output-Width": str(out_w),
             "X-Output-Height": str(out_h),
         },

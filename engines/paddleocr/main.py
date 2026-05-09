@@ -67,7 +67,7 @@ async def ocr(file: UploadFile = File(...)):
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         img_array = np.array(image)
 
-        results = ocr_engine.ocr(img_array, cls=True)
+        results = ocr_engine.ocr(img_array)
 
         lines: list[str] = []
         confidences: list[float] = []
@@ -85,9 +85,7 @@ async def ocr(file: UploadFile = File(...)):
                         regions.append({
                             "polygon": box,
                             "text": text,
-                            "confidence": conf,
-                            "angle": 0,
-                            "angle_confidence": 0.0
+                            "confidence": conf
                         })
 
         text = "\n".join(lines).strip()
