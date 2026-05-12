@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     global reader
     logger.info("Loading EasyOCR model (this may take a while on first run)...")
     try:
-        reader = easyocr.Reader(["en"], gpu=False)
+        reader = easyocr.Reader(["en", "lv"], gpu=False)
         logger.info("EasyOCR model loaded.")
     except Exception as exc:
         logger.error("EasyOCR model load failed: %s", exc)

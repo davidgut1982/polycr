@@ -37,6 +37,7 @@ async def create_pdf(
     file: UploadFile = File(...),
     deskew: bool = Query(default=True, description="Deskew the input image before OCR"),
     optimize: int = Query(default=1, ge=0, le=3, description="PDF optimization level (0-3)"),
+    language: str = Query(default="eng", description="Tesseract language code for OCR (e.g. 'eng', 'lav'). Must be installed in the container."),
 ):
     """
     Why: Produces a PDF/A-compliant searchable document suitable for archival storage
@@ -59,7 +60,7 @@ async def create_pdf(
         cmd = ["ocrmypdf"]
         if deskew:
             cmd.append("--deskew")
-        cmd += ["--optimize", str(optimize), tmp_in_path, tmp_out_path]
+        cmd += ["--optimize", str(optimize), "--language", language, tmp_in_path, tmp_out_path]
 
         result = subprocess.run(
             cmd,

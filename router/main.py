@@ -22,7 +22,7 @@ import cv2
 import httpx
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, Form, HTTPException, UploadFile, File
+from fastapi import FastAPI, Form, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response
 from docaligner import DocAligner
 
@@ -53,12 +53,13 @@ app = FastAPI(
 )
 
 
-async def call_engine(name: str, image_bytes: bytes) -> EngineResult:
+async def call_engine(name: str, image_bytes: bytes, language: str = "eng") -> EngineResult:
     """
     Why: Isolates per-engine HTTP communication so failures in one engine never
          propagate to others or crash the router.
     What: POSTs image bytes to the named engine's /ocr endpoint within a 60-second
           timeout; wraps any exception into an EngineResult with an error field.
+          Passes language param to engines that support it (tesseract).
     Test: Point the router at a non-existent hostname; assert the returned EngineResult
           has a non-empty error field and engine == the hostname used.
     """
@@ -68,6 +69,7 @@ async def call_engine(name: str, image_bytes: bytes) -> EngineResult:
             response = await client.post(
                 url,
                 files={"file": ("image.jpg", image_bytes, "image/jpeg")},
+                params={"language": language},
             )
             data = response.json()
             return EngineResult(**data)
@@ -105,18 +107,21 @@ async def process(file: UploadFile = File(...)):
 
 
 @app.post("/ocr/raw")
-async def ocr_raw(file: UploadFile = File(...)):
+async def ocr_raw(
+    file: UploadFile = File(...),
+    language: str = Query(default="eng", description="OCR language code (e.g. 'eng', 'lav'). Passed to engines that support per-request language selection."),
+):
     """
     Why: Allows callers to inspect raw engine outputs without LLM reconciliation,
          useful for debugging discrepancies or building custom reconciliation logic.
     What: Preprocesses the image and fans out to all engines; returns the raw list
-          of EngineResult dicts without calling the LLM.
+          of EngineResult dicts without calling the LLM. Passes language to engines.
     Test: POST a JPEG to /ocr/raw; assert response contains "results" list with one
           entry per enabled engine.
     """
     image_bytes = await file.read()
     clean = preprocess_image(image_bytes)
-    results = await asyncio.gather(*[call_engine(e.strip(), clean) for e in ENABLED_ENGINES])
+    results = await asyncio.gather(*[call_engine(e.strip(), clean, language) for e in ENABLED_ENGINES])
     return {"results": [r.dict() for r in results]}
 
 
@@ -458,71 +463,157 @@ def _cluster_score(cluster, image_area: float) -> float:
 
 
 def _infer_4_corners_from_2_diagonal(corners: list[list[float]]) -> Optional[list[list[float]]]:
+    """
+    Phase 3c: Geometric inference for 2 diagonal corners.
+    Infer 4 corners from 2 diagonal corners by assuming axis-aligned rectangle.
+
+    Why: When DocAligner returns only 2 corners (diagonal opposites) on low-contrast
+         receipts, assume the document is roughly axis-aligned and infer the other 2.
+    What: Takes [top-left, bottom-right] (or vice-versa) and returns [TL, TR, BR, BL].
+    Test: corners=[[100, 100], [400, 400]] → [[100, 100], [400, 100], [400, 400], [100, 400]].
+    """
     if len(corners) != 2:
         return None
+
     p1, p2 = corners[0], corners[1]
+
+    # Determine which corner is closer to top-left by coordinate sum
     if p1[0] + p1[1] < p2[0] + p2[1]:
         tl, br = p1, p2
     else:
         tl, br = p2, p1
-    return [tl, [br[0], tl[1]], br, [tl[0], br[1]]]
+
+    # Construct 4 corners from diagonal: TL, TR, BR, BL
+    result = [
+        tl,                    # TL: (min_x, min_y)
+        [br[0], tl[1]],       # TR: (max_x, min_y)
+        br,                    # BR: (max_x, max_y)
+        [tl[0], br[1]]        # BL: (min_x, max_y)
+    ]
+    return result
 
 
 def _infer_4_corners_from_3_parallelogram(corners: list[list[float]]) -> Optional[list[list[float]]]:
+    """
+    Phase 3c: Geometric inference for 3 corners (parallelogram closure).
+    Infer the 4th corner from 3 corners using parallelogram geometry.
+
+    Why: When DocAligner returns 3 corners, use vector closure D = A + C - B.
+    What: Takes 3 corners in order and returns 4 corners [A, B, C, D].
+    Test: corners=[[100, 100], [400, 100], [400, 400]] →
+          [[100, 100], [400, 100], [400, 400], [100, 400]].
+    """
     if len(corners) != 3:
         return None
+
     a, b, c = corners[0], corners[1], corners[2]
+
+    # Parallelogram closure: D = A + C - B
     d = [a[0] + c[0] - b[0], a[1] + c[1] - b[1]]
-    return [a, b, c, d]
+
+    # Return in order: A, B, C, D
+    result = [a, b, c, d]
+    return result
 
 
-def _validate_quadrilateral_aspect(corners: list[list[float]], min_aspect: float = 0.3, max_aspect: float = 4.0) -> bool:
+def _validate_quadrilateral_aspect(corners: list[list[float]],
+                                    min_aspect: float = 0.3,
+                                    max_aspect: float = 4.0) -> bool:
+    """
+    Phase 3c: Validate quadrilateral aspect ratio for geometric inference results.
+
+    Why: Geometric inference can produce extreme aspect ratios on poor detections.
+         Validate to avoid accepting obviously wrong closures.
+    What: Checks bounding box h/w ratio is within [min_aspect, max_aspect].
+    Test: corners=[[100, 100], [400, 100], [400, 400], [100, 400]] → True.
+          corners=[[100, 100], [450, 100], [450, 400], [100, 400]] (1.33) → True.
+          corners=[[100, 100], [10100, 100], [10100, 400], [100, 400]] (0.04) → False.
+    """
     if len(corners) != 4:
         return False
+
     xs = [c[0] for c in corners]
     ys = [c[1] for c in corners]
+
     w = max(xs) - min(xs)
     h = max(ys) - min(ys)
+
+    # Reject degenerate cases
     if w < 10 or h < 10:
         return False
+
     aspect = h / w if w > 0 else float('inf')
-    return min_aspect <= aspect <= max_aspect
+    is_valid = min_aspect <= aspect <= max_aspect
+
+    return is_valid
 
 
 def detect_corners_docaligner(img: np.ndarray) -> Optional[list[list[float]]]:
     """
-    Purpose-built CNN for document corner detection with Phase 3c geometric inference.
+    Why: Purpose-built CNN for document corner detection. Returns ordered corners
+         (TL, TR, BR, BL) that encode orientation by construction.
+         Phase 3c: When DocAligner returns < 4 corners, apply geometric inference
+         (2 → infer 4 as axis-aligned; 3 → parallelogram closure).
+    What: Runs DocAligner heatmap regression model on BGR image, returns 4 corners
+          in original image coordinates, or None if no document detected or inference fails.
+    Test: Pass a receipt image; expect 4 [x, y] points within image bounds.
     """
     try:
         aligner = _get_docaligner()
         result = aligner(img)
         h, w = img.shape[:2]
+
+        # If None or no corners, reject
         if result is None or len(result) == 0:
             return None
+
+        # Convert to list of [x, y] pairs
         corners = result.tolist()
+
+        # Full 4 corners detected: use directly
         if len(corners) == 4:
-            valid = all(0 <= c[0] <= w and 0 <= c[1] <= h for c in corners)
+            # Sanity: ensure all points within image bounds
+            valid = all(
+                0 <= c[0] <= w and 0 <= c[1] <= h
+                for c in corners
+            )
             return corners if valid else None
+
+        # Partial detection: try geometric inference (Phase 3c)
         if len(corners) == 2:
-            logger.info("DocAligner returned 2 corners; attempting geometric inference")
+            logger.info(f"DocAligner returned 2 corners; attempting geometric inference (diagonal closure)")
             inferred = _infer_4_corners_from_2_diagonal(corners)
             if inferred and _validate_quadrilateral_aspect(inferred):
-                valid = all(0 <= c[0] <= w and 0 <= c[1] <= h for c in inferred)
+                # Sanity: ensure all inferred points within image bounds
+                valid = all(
+                    0 <= c[0] <= w and 0 <= c[1] <= h
+                    for c in inferred
+                )
                 if valid:
-                    logger.info(f"Geometric inference succeeded (2->4): {inferred}")
+                    logger.info(f"Geometric inference succeeded (2→4): {inferred}")
                     return inferred
+            logger.warning(f"Geometric inference failed for 2 corners {corners}")
             return None
+
         if len(corners) == 3:
-            logger.info("DocAligner returned 3 corners; attempting parallelogram closure")
+            logger.info(f"DocAligner returned 3 corners; attempting geometric inference (parallelogram closure)")
             inferred = _infer_4_corners_from_3_parallelogram(corners)
             if inferred and _validate_quadrilateral_aspect(inferred):
-                valid = all(0 <= c[0] <= w and 0 <= c[1] <= h for c in inferred)
+                # Sanity: ensure all inferred points within image bounds
+                valid = all(
+                    0 <= c[0] <= w and 0 <= c[1] <= h
+                    for c in inferred
+                )
                 if valid:
-                    logger.info(f"Geometric inference succeeded (3->4): {inferred}")
+                    logger.info(f"Geometric inference succeeded (3→4): {inferred}")
                     return inferred
+            logger.warning(f"Geometric inference failed for 3 corners {corners}")
             return None
-        logger.warning(f"DocAligner returned {len(corners)} corners (unexpected)")
+
+        # More than 4 corners: unexpected, reject
+        logger.warning(f"DocAligner returned {len(corners)} corners (unexpected); rejecting")
         return None
+
     except Exception as e:
         logger.warning(f"DocAligner detection failed: {e}")
         return None
@@ -687,6 +778,7 @@ async def correct_document(
     detected_corners, redetect_status = await detect_corners_internal(img_cv)
 
     # Sanity check: if detected region has extreme aspect, fall back to full image
+    # Exception: if detection is from DocAligner and wide, we'll handle it post-warp
     if detected_corners is not None:
         det_x_coords = [c[0] for c in detected_corners]
         det_y_coords = [c[1] for c in detected_corners]

@@ -14,7 +14,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import pytesseract
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, Query, UploadFile, File
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO)
@@ -50,11 +50,15 @@ async def health():
 
 
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...)):
+async def ocr(
+    file: UploadFile = File(...),
+    language: str = Query(default="eng", description="Tesseract language code (e.g. 'eng', 'lav'). Must be installed on the system."),
+):
     """
     Why: Central OCR endpoint consumed by the polycr router.
     What: Reads an uploaded image, runs pytesseract for text and per-word confidence,
           averages confidence across all detected words, and returns a standardised result.
+          Accepts an optional language param to select the Tesseract language pack.
     Test: POST an image with the word "Hello" — expect text containing "Hello" and
           confidence between 0 and 100; POST a blank image — expect empty text, no error key.
     """
@@ -62,9 +66,9 @@ async def ocr(file: UploadFile = File(...)):
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes))
 
-        text = pytesseract.image_to_string(image).strip()
+        text = pytesseract.image_to_string(image, lang=language).strip()
 
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(image, lang=language, output_type=pytesseract.Output.DICT)
         confidences = [
             float(c)
             for c in data["conf"]
