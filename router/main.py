@@ -495,8 +495,15 @@ async def correct_document(
 
     if detected_corners is None:
         h, w = img_cv.shape[:2]
+        if w > h:
+            logger.info(f"fallback is landscape ({w}x{h}); rotating 90 CW to portrait")
+            img_cv = cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE)
+            h, w = img_cv.shape[:2]
+            post_warp_rotation = 90
+            redetect_status = "fallback-none-rotated"
+        else:
+            redetect_status = "none"
         detected_corners = [[0, 0], [w, 0], [w, h], [0, h]]
-        redetect_status = "none"
 
     ordered = _order_corners(detected_corners)
 
