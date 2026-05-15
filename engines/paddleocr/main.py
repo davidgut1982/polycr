@@ -5,6 +5,7 @@ Why: Exposes PaddleOCR behind the standard polycr REST contract, adding a
      high-accuracy CRNN-based alternative to the other engines.
 What: FastAPI service that initialises PaddleOCR at startup and returns text with
       averaged confidence from the per-line result list, plus polygon regions.
+      Supports PaddleOCR 2.x list format and 3.x dict format transparently.
 Test: POST /ocr with a receipt image → engine=="paddleocr" and non-empty text;
       GET /health → {"status": "ok", "engine": "paddleocr"}.
 """
@@ -43,23 +44,11 @@ app = FastAPI(title="polycr-paddleocr", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    """
-    Why: Docker and router health probe.
-    What: Returns ok payload with engine name.
-    Test: GET /health → HTTP 200 {"status": "ok", "engine": "paddleocr"}.
-    """
     return {"status": "ok", "engine": ENGINE_NAME}
 
 
 @app.post("/ocr")
 async def ocr(file: UploadFile = File(...)):
-    """
-    Why: Standard OCR endpoint consumed by the router.
-    What: Converts uploaded image to numpy array, runs PaddleOCR, flattens the
-          nested result list (pages → lines → [box, (text, conf)]) and averages
-          confidence across all detected text regions. Returns polygon regions.
-    Test: POST a document image → expect text and confidence > 0 for real content.
-    """
     if ocr_engine is None:
         return {"engine": ENGINE_NAME, "error": "Model not loaded"}
     try:
@@ -73,19 +62,38 @@ async def ocr(file: UploadFile = File(...)):
         confidences: list[float] = []
         regions: list[dict] = []
         if results:
-            for page in results:
-                if page:
-                    for line in page:
-                        box = line[0]  # polygon: [[x,y], [x,y], [x,y], [x,y]]
+            for page_result in results:
+                if isinstance(page_result, dict):
+                    texts = page_result.get('rec_texts', [])
+                    scores = page_result.get('rec_scores', [])
+                    polys = page_result.get('dt_polys', page_result.get('rec_polys', []))
+                    for i, (text, score) in enumerate(zip(texts, scores)):
+                        poly = polys[i].tolist() if i < len(polys) else []
+                        lines.append(str(text))
+                        conf = float(score)
+                        confidences.append(conf)
+                        regions.append({
+                            "polygon": poly,
+                            "text": str(text),
+                            "confidence": conf,
+                        })
+                elif isinstance(page_result, list):
+                    for line in page_result:
+                        if not line or len(line) < 2:
+                            continue
+                        box = line[0]
                         text_conf = line[1]
-                        text = text_conf[0]
-                        conf = float(text_conf[1])
+                        if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
+                            text = str(text_conf[0])
+                            conf = float(text_conf[1])
+                        else:
+                            continue
                         lines.append(text)
                         confidences.append(conf)
                         regions.append({
-                            "polygon": box,
+                            "polygon": box if isinstance(box, list) else box.tolist(),
                             "text": text,
-                            "confidence": conf
+                            "confidence": conf,
                         })
 
         text = "\n".join(lines).strip()

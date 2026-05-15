@@ -1,12 +1,4 @@
-"""Shared Pydantic models for the polycr router.
-
-Why: Centralises request/response schemas so the router endpoints, LLM reconciler,
-     and tests all share a single source of truth without duplicating field names.
-What: Defines EngineResult (per-engine OCR output) and ProcessResponse (full pipeline
-      response) as Pydantic BaseModel subclasses.
-Test: Instantiate EngineResult(engine="x", text="hello", confidence=90.0) and assert
-      .engine == "x"; instantiate ProcessResponse with all fields and assert .dict() is valid.
-"""
+"""Shared Pydantic models for the polycr router."""
 
 from typing import Any
 
@@ -22,7 +14,6 @@ class Region(BaseModel):
 
 class EngineResult(BaseModel):
     """Single engine OCR output, including an optional error field."""
-
     engine: str
     text: str = ""
     confidence: float = 0.0
@@ -32,7 +23,6 @@ class EngineResult(BaseModel):
 
 class ProcessResponse(BaseModel):
     """Full pipeline response returned by POST /process."""
-
     text: str
     structured: dict[str, Any]
     ocr_raw: list[EngineResult]

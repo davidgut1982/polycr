@@ -1,16 +1,11 @@
-FROM python:3.10-slim
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    libgomp1 \
-    imagemagick \
-    libmagickwand-dev \
-    libturbojpeg0 \
-    libturbojpeg0-dev \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py preprocess.py llm.py models.py ./
-HEALTHCHECK --interval=30s --timeout=10s CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+FROM 192.168.1.4:5000/polycr-router:latest
+
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir docaligner-docsaid onnxruntime
+
+RUN ln -sf /usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf /usr/local/lib/python3.10/site-packages/capybara/vision/visualization/NotoSansMonoCJKtc-VF.ttf
+
+RUN python3 -c "from capybara.vision.visualization.draw import draw_box; print('capybara verify OK')"
+
+COPY main.py /app/main.py

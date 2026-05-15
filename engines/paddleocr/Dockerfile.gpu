@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM paddlepaddle/paddle:3.3.1-gpu-cuda12.6-cudnn9.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
@@ -8,13 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir paddlepaddle==3.0.0
-
 RUN pip install --no-cache-dir \
     paddleocr==3.5.0 \
     fastapi==0.104.1 \
     "uvicorn[standard]==0.24.0" \
-    python-multipart==0.0.6
+    python-multipart==0.0.6 \
+    numpy \
+    pillow
 
 ARG BOS_BASE=https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0
 ARG MODEL_DIR=/root/.paddlex/official_models

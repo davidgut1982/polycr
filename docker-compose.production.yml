@@ -1,0 +1,80 @@
+# Production deployment — uses pre-built images from private registry.
+# Models are baked into images at build time (offline mode).
+# Registry: 192.168.1.4:5000 (HTTPS)
+# Host: 192.168.1.30 (RTX 3060 + Tesla P4)
+# Usage: docker compose -f docker-compose.production.yml up -d
+
+services:
+  router:
+    image: ${REGISTRY:-192.168.1.4:5000}/polycr-router:offline
+    container_name: polycr-router-1
+    restart: unless-stopped
+    environment:
+      ENABLED_ENGINES: tesseract,paddleocr
+    ports:
+      - "8000:8000"
+    depends_on:
+      tesseract:
+        condition: service_healthy
+      paddleocr:
+        condition: service_started
+    networks:
+      - polycr
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  tesseract:
+    image: ${REGISTRY:-192.168.1.4:5000}/polycr-tesseract:latest
+    container_name: polycr-tesseract-1
+    restart: unless-stopped
+    networks:
+      - polycr
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  paddleocr:
+    image: ${REGISTRY:-192.168.1.4:5000}/polycr-paddleocr:offline-gpu
+    container_name: polycr-paddleocr-1
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+      FLAGS_check_nan_inf: "0"
+    networks:
+      - polycr
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  ocrmypdf:
+    image: ${REGISTRY:-192.168.1.4:5000}/ocrmypdf:latest
+    container_name: polycr-ocrmypdf-1
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    networks:
+      - polycr
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  polycr:
+    name: polycr_default
+    driver: bridge
